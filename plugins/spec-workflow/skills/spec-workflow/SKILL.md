@@ -187,9 +187,9 @@ After handoff, keep only the selected branch in scope until the user changes dir
 
 ## Final Acceptance
 
-After the selected branch has no unchecked tasks in `<specs_dir>/tasks.md`, first run local pre-acceptance with `python <plugin-root>/scripts/validate_spec.py <specs_dir> --pre-acceptance`, then read and follow `../spec-acceptance/SKILL.md`.
+After the selected branch has no unchecked tasks in `<specs_dir>/tasks.md`, first run local pre-acceptance with `python <plugin-root>/scripts/validate_spec.py <specs_dir> --pre-acceptance`, then read and follow `../spec-acceptance/SKILL.md`. The current Spec workflow opt-in covers the review agents required by that skill; do not ask for a second orchestration authorization.
 
-Do not report the whole Spec workflow complete until final acceptance passes. If acceptance finds actionable issues, route them into the Bugfix branch and repeat final acceptance after the fix.
+Do not report the whole Spec workflow complete until final acceptance passes. New runs use adaptive acceptance by default: independent unit review, risk- or issue-triggered adversarial review, targeted delta re-review, and one final global integration review. Record acceptance repairs in `acceptance-fixes.md`; do not append them to the original task plan or restart the entire review when only affected units changed.
 
 ## High-Risk Warning
 

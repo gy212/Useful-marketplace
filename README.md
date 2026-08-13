@@ -166,13 +166,28 @@ It includes seven skills:
 - `spec-requirements-first`: create product-led feature specs.
 - `spec-design-first`: create design-led specs from fixed architecture or technical constraints.
 - `spec-bugfix`: create evidence-led bugfix specs before code changes.
-- `spec-acceptance`: run final multi-agent acceptance after all approved tasks are complete.
+- `spec-acceptance`: run resumable adaptive acceptance after all approved tasks are complete.
 
 Explicitly invoke it for complex features, cross-module refactors, design-first work, regressions, production fixes, or high-risk changes. For tiny local edits, the workflow can be heavier than the task; low-risk work can opt into Quick Plan only with explicit human authorization.
 
 ## Workflow
 
-![Spec workflow plugin workflow](spec-workflow-flowchart.png)
+```mermaid
+flowchart LR
+    A["Approved tasks complete"] --> B["Machine pre-acceptance"]
+    B --> C{"Acceptance mode"}
+    C -->|"Quick, low risk"| G["Global integration review"]
+    C -->|"Adaptive, default"| D["Independent unit review"]
+    C -->|"Full"| E["Unit review + adversarial review"]
+    D --> F{"High risk or P0-P2?"}
+    F -->|"yes"| E
+    F -->|"no"| G
+    E --> G
+    G --> H{"P0-P2 found?"}
+    H -->|"yes, max 2 fix cycles"| I["Fix + affected-unit re-review"]
+    I --> G
+    H -->|"no"| J["Hard finish gate"]
+```
 
 Generated artifacts live in an isolated workflow directory under `docs/specs/<run-id>/`; chat-only plans are not the source of truth. Legacy root-level `docs/specs/tasks.md` workflows remain readable, but new workflows must not write to the root directory.
 
@@ -191,9 +206,9 @@ Generated artifacts live in an isolated workflow directory under `docs/specs/<ru
    - `<specs_dir>/spec.yml`: Kiro-compatible machine index for workflow, artifacts, approval, risk, requirement IDs, task graph, current task, `artifact_hashes`, and `task_plan_hash`.
 6. After human approval, `spec_progress.py approve` or MCP `spec_approve` freezes the approved spec and task-plan baseline.
 7. Implementation proceeds through Spec Progress CLI/MCP task updates, one safe task wave at a time.
-8. When no unchecked tasks remain, local pre-acceptance runs before strict final multi-agent acceptance.
+8. When no unchecked tasks remain, local pre-acceptance runs before adaptive final acceptance. The original workflow opt-in covers the required review orchestration; no second ritual authorization is required.
 
-Task plans must meet a quality bar before approval: each task declares `接口` fields (consumed and produced signatures, `无` when empty) so a context-free executor can run it alone, placeholder text like `TBD` or `类似 T-xxx` counts as a plan failure, and the plan is self-reviewed for requirement coverage and cross-task interface consistency. During implementation, each task must pass a two-phase review — spec compliance plus code quality, preferably by a fresh review subagent that sees only the task, spec excerpts, and diff — before `complete`. The Bugfix branch additionally enforces a root-cause investigation discipline: no fix proposals before evidence-backed root-cause analysis, one written hypothesis per self-healing loop, and a hard stop with human escalation after three failed loops.
+Task plans must meet a quality bar before approval: each task declares `接口` fields (consumed and produced signatures, `无` when empty) so a context-free executor can run it alone, placeholder text like `TBD` or `类似 T-xxx` counts as a plan failure, and the plan is self-reviewed for requirement coverage and cross-task interface consistency. During implementation, each task gets a lightweight two-phase self-check — spec compliance plus code quality — before `complete`; a separate task-level reviewer is reserved for material uncertainty or critical risk because final acceptance supplies the independent review. The Bugfix branch additionally enforces a root-cause investigation discipline: no fix proposals before evidence-backed root-cause analysis, one written hypothesis per self-healing loop, and a hard stop with human escalation after three failed loops.
 
 The preferred implementation approval phrase for every branch is:
 
@@ -245,14 +260,14 @@ python plugins/spec-workflow/scripts/spec_progress.py skip <specs_dir> T-001 --a
 python plugins/spec-workflow/scripts/spec_progress.py waves <specs_dir>
 python plugins/spec-workflow/scripts/spec_progress.py sync-check <specs_dir>
 python plugins/spec-workflow/scripts/spec_progress.py pre-acceptance <specs_dir>
-python plugins/spec-workflow/scripts/spec_progress.py acceptance-init <specs_dir>
+python plugins/spec-workflow/scripts/spec_progress.py acceptance-init <specs_dir> --mode adaptive
 python plugins/spec-workflow/scripts/spec_progress.py acceptance-status <specs_dir>
 python plugins/spec-workflow/scripts/spec_progress.py acceptance-plan-fixes <specs_dir>
 python plugins/spec-workflow/scripts/spec_progress.py acceptance-next-round <specs_dir>
 python plugins/spec-workflow/scripts/spec_progress.py acceptance-finish <specs_dir>
 ```
 
-`approve` records the human approval and freezes the baseline. `complete` requires verification evidence. `skip` requires explicit human approval evidence. Task updates also synchronize the top-level `tasks.md` status, current task, progress count, and completion log. If a task is active and the worktree has business-code changes after an interruption, `resume` reports `interrupted`; the next agent must inspect the diff and evidence before continuing.
+`approve` records the human approval and freezes the baseline. `complete` requires verification evidence. `skip` requires explicit human approval evidence. `acceptance-init` accepts `quick`, `adaptive` (default), or `full`; Quick is rejected when any task is high risk. Task updates also synchronize the top-level `tasks.md` status, current task, progress count, and completion log. If a task is active and the worktree has business-code changes after an interruption, `resume` reports `interrupted`; the next agent must inspect the diff and evidence before continuing.
 
 After approval, primary spec artifacts and the task plan are immutable. Progress updates may change checkbox/status/evidence/completed_at/notes/blocker, top-level progress summary, completion log, `progress.md`, and current-task/index state. If requirements, design, root cause, or task plan must change, run `sync-check --write` to mark `reapproval-required`, update specs, obtain a new approval, and run `approve` again.
 
@@ -269,7 +284,7 @@ The plugin registers the same stdio MCP server through `.codex-plugin/plugin.jso
 - `spec_complete_task`
 - `spec_block_task`
 - `spec_skip_task`
-- `spec_acceptance_init`
+- `spec_acceptance_init` (`mode`: `quick`, `adaptive`, or `full`)
 - `spec_acceptance_status`
 - `spec_acceptance_start_agent`
 - `spec_acceptance_complete_agent`
@@ -327,11 +342,13 @@ python plugins/spec-workflow/scripts/validate_spec.py <specs_dir> --pre-acceptan
 
 ## Final Acceptance
 
-Final acceptance is intentionally strict. Local `pre-acceptance` may verify readiness when sub-agents are unavailable, but it is not final acceptance. Strict final acceptance requires explicit authorization to orchestrate sub-agents for first-wave review and adversarial review. If the current environment cannot run sub-agents, the workflow is blocked at acceptance; it must not be downgraded to a single-agent self-review or reported as complete.
+Local `pre-acceptance` is a machine readiness gate, not final acceptance. New ledgers default to Adaptive: every review unit gets one fresh independent reviewer, while adversarial review is added only for high-risk units or when the first reviewer reports an evidence-backed P0-P2 issue. Quick is a low-risk-only path with the machine gate plus one global independent review. Full preserves dual review for every unit when explicitly requested or justified by broad critical coupling. If the environment cannot run the agents required by the selected mode, acceptance remains blocked rather than silently becoming self-review.
 
-Acceptance is resumable through `<specs_dir>/acceptance_state.json`. The state file freezes the original `tasks.md` task IDs, records review units, tracks which sub-agents are planned/running/completed, and records issue/fix/deferred status. After context compaction or interruption, agents must run `acceptance-status` and resume only the missing agents instead of rebuilding all review units.
+Acceptance is resumable through `<specs_dir>/acceptance_state.json`. The v2 state freezes original task IDs and text, stores the selected mode, required reviewers, issues, fixes, affected units, and global integration status. Unfinished v1 ledgers resume as Full for compatibility. After interruption, `acceptance-status` is the source of truth; only missing agents and affected units are resumed.
 
-Confirmed acceptance issues are repaired through `<specs_dir>/acceptance-fixes.md`, not by appending tasks to the original `<specs_dir>/tasks.md`. Rounds 1-3 may fix all evidence-backed actionable issues. From round 4 onward, only P0-P2 issues are auto-fixed; P3/P4 issues are deferred unless a human upgrades them. Round 6 is the hard stop for unresolved P0-P2 issues.
+Confirmed P0-P2 findings are repaired through `<specs_dir>/acceptance-fixes.md`, never by appending to the approved task plan. P3/P4 findings are deferred immediately. In Git workflows, repaired business code is committed before delta and global re-review. The workflow permits at most two automatic fix-and-delta-review cycles; a later P0-P2 finding permanently blocks that ledger. The human must stop without acceptance or choose repair/reapproval followed by a fresh ledger. Passing unchanged units remain sealed instead of being reviewed again.
+
+Every mode ends with a fresh global integration review. `acceptance-finish` re-runs pre-acceptance and fails closed unless required unit reviewers passed, every ACTIONABLE_ISSUES result is bound to recorded issue IDs, no issue/fix/affected unit remains, the integration reviewer passed, and the reviewed artifacts, Git commit, and non-ledger worktree content still match its snapshot. Approved artifact hashes normalize LF/CRLF checkout differences while accepting legacy raw hashes, so Windows line endings do not create false baseline drift.
 
 ## High-Risk Work
 
