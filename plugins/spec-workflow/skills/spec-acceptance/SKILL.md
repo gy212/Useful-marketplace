@@ -5,11 +5,13 @@ description: Explicit activation only. Internal final step of a user-invoked spe
 
 # Spec workflow Acceptance
 
-Use this as the final step after a Spec workflow branch finishes every task in `<specs_dir>/tasks.md`. Its job is to verify the whole workflow outcome. It does not create `<specs_dir>/acceptance.md`; resumable acceptance state lives in `<specs_dir>/acceptance_state.json`, and acceptance repair work lives in `<specs_dir>/acceptance-fixes.md`.
+Use this after every approved task in `<specs_dir>/tasks.md` is complete or explicitly skipped. Resumable review state lives in `<specs_dir>/acceptance_state.json`; acceptance repairs live in `<specs_dir>/acceptance-fixes.md`. Do not create a parallel `acceptance.md` or append repair tasks to the frozen task plan.
 
 ## Activation Boundary
 
-This skill may run only inside a user-initiated spec-workflow run. If named directly, enter through the `spec-workflow` router and resume gates before acceptance. Generic review or verification requests must not activate it.
+This skill may run only inside a user-initiated spec-workflow run. If named directly, enter through the `spec-workflow` router and its resume gates first. A generic request to review or verify code must not activate this plugin.
+
+The user's original opt-in to the current Spec workflow covers the review agents needed to finish that same workflow. Do not pause for a second, ritual authorization before acceptance. Stop only if orchestration would materially expand scope, use a newly sensitive resource, incur an unapproved cost, or perform another separately consequential action.
 
 ## Required Announcement
 
@@ -21,94 +23,71 @@ If the branch skill has not already printed the announcement, print:
 
 ## Hard Rules
 
-- Enter only when `<specs_dir>/tasks.md` has no unchecked `- [ ]` tasks.
-- Treat skipped `- [~]` tasks as valid only when the task text or completion log records explicit human approval to skip.
-- Do not report the whole Spec workflow complete before this acceptance flow passes.
-- Do not spawn sub-agents unless the current conversation explicitly authorizes sub-agent orchestration. If authorization is missing, ask for it and stop.
-- Do not downgrade this flow to a single local review or pretend local review is equivalent to multi-agent acceptance.
-- Local `pre-acceptance` is allowed before sub-agent review, but it is only a readiness check. It must never be reported as final acceptance.
-- If the current environment cannot orchestrate sub-agents, state that final acceptance is blocked by missing orchestration capability and do not report the workflow complete.
-- Do not edit business source code inside this skill. Confirmed issues must be recorded through the acceptance progress tools first, then fixed from `<specs_dir>/acceptance-fixes.md`.
-- Never append acceptance repair tasks to the original `<specs_dir>/tasks.md`. The original task IDs are frozen at acceptance start; if they change, final acceptance is blocked.
-- Before spawning any sub-agent, run `acceptance-status` (MCP `spec_acceptance_status` or CLI) when `acceptance_state.json` exists. Resume pending agents instead of rebuilding all units from memory.
-- Every issue must have severity `P0` through `P4`, affected unit/task IDs, and evidence. Unsupported opinions or style preferences are not actionable issues.
-- Rounds 1-3 may auto-fix all evidence-backed actionable issues. From round 4 onward, only `P0`, `P1`, and `P2` issues are auto-fixed; `P3` and `P4` issues are deferred unless the human explicitly upgrades them. Stop at round 6 and request human decision if any `P0`-`P2` issue remains.
-- Final success output must summarize the completed plugin workflow, not dump raw agent review transcripts.
+- Enter only when `<specs_dir>/tasks.md` has no unchecked tasks and every completed or skipped task has evidence.
+- Run local pre-acceptance first, but never report that readiness check as final acceptance.
+- Do not report the whole Spec workflow complete until `acceptance-finish` succeeds.
+- Use fresh independent reviewers. A reviewer must not edit the files it reviews.
+- If the environment cannot orchestrate the agents required by the selected acceptance mode, report that final acceptance is blocked; do not replace them with self-review.
+- Read `acceptance-status` before launching agents whenever the state file exists. Resume planned/running work instead of rebuilding it from chat history.
+- Record every issue with severity, evidence, affected task IDs, and the reporting agent ID. Unsupported opinions are notes, not issues.
+- Return `ACTIONABLE_ISSUES` only for evidence-backed `P0`, `P1`, or `P2` findings. Record `P3`/`P4` advisory findings, but return `PASS` when no P0-P2 finding remains.
+- Only P0-P2 findings enter the automatic fix queue. P3/P4 are deferred immediately.
+- Run at most two automatic fix-and-re-review cycles. If a new or unresolved P0-P2 finding remains after that limit, this ledger ends blocked: a human may stop without acceptance, or authorize repair/reapproval and a fresh acceptance ledger. Do not reopen or reinterpret the exhausted ledger.
+- Re-review only affected units. Previously passing, unchanged units remain sealed.
+- A fresh global integration review must pass after all required unit reviews and repairs.
+- Never modify the approved baseline or refresh hashes in order to make acceptance pass.
 
-## State A: Acceptance Preconditions
+## State A: Preconditions
 
-Read the approved spec artifacts, `<specs_dir>/tasks.md`, relevant diffs, and verification results.
+Read the approved primary artifacts, `tasks.md`, relevant diffs, and recorded verification. Detect the branch from its artifacts:
 
-Detect the workflow from the spec files:
+- Requirements-First: `product.md`, `architecture.md`, `tasks.md`
+- Design-First: `design.md`, `requirements.md`, `tasks.md`
+- Bugfix: `bugfix.md`, `design.md`, `tasks.md`
 
-- Requirements-First: `product.md`, `architecture.md`, and `tasks.md`
-- Design-First: `design.md`, `requirements.md`, and `tasks.md`
-- Bugfix: `bugfix.md`, `design.md`, and `tasks.md`
-
-If any task is still unchecked, return to the selected branch's Controlled Implementation state. If required verification evidence is missing, treat that as an acceptance issue.
-
-Before asking for sub-agent authorization, run or request the equivalent of:
+Run:
 
 ```bash
 python <plugin-root>/scripts/validate_spec.py <specs_dir> --pre-acceptance
 ```
 
-If `<specs_dir>/acceptance_state.json` already exists, resume with:
+If it fails, return to controlled implementation and repair the reported readiness issue. If state already exists, resume it with:
 
 ```bash
 python <plugin-root>/scripts/spec_progress.py acceptance-status <specs_dir>
 ```
 
-Use the returned pending/running agent IDs and affected units as the source of truth. Do not infer missing agents from chat history.
+Treat the returned mode, agent IDs, affected units, issues, and fixes as authoritative.
 
-If pre-acceptance fails, summarize the local issues and route them back to the selected branch or Bugfix path. If pre-acceptance passes but sub-agent orchestration is unavailable, the required wording is:
+## State B: Choose And Initialize The Review Mode
 
-```markdown
-预检通过，但严格验收未完成：当前环境不支持按 `tasks.md` 编排子 agent 审查和对抗审查。根据 Spec workflow 规则，不能把 pre-acceptance 伪装为 final acceptance，也不能宣告整个工作流完成。
-```
+For a new acceptance ledger, select one of these modes:
 
-If sub-agent authorization is missing, ask:
+- `adaptive` (default): one independent first-wave reviewer per unit; add an adversarial reviewer only for a high-risk unit or when the first reviewer reports P0-P2 issues.
+- `quick`: low-risk work only; skip per-unit reviewers and run one independent global integration review after the machine gate. Use only when the user explicitly chooses the lightweight acceptance path. The state tool rejects high-risk tasks.
+- `full`: first-wave plus adversarial review for every unit. Use when explicitly requested or when broad, critical coupling warrants the extra cost.
 
-```markdown
-结尾验收需要按 `tasks.md` 编排子 agent 进行审查和对抗审查。请明确授权我启动子 agent 后，我再继续验收流程。
-```
-
-If sub-agent orchestration is unavailable in the current environment, stop with:
-
-```markdown
-结尾验收被阻塞：当前环境不支持按 `tasks.md` 编排子 agent 审查和对抗审查。根据 Spec workflow 规则，不能降级为单 agent 自审，也不能宣告整个工作流完成。
-```
-
-## State B: Initialize Or Resume Acceptance
-
-If no acceptance state exists, initialize it:
+Initialize once; the selected mode is frozen for that ledger:
 
 ```bash
-python <plugin-root>/scripts/spec_progress.py acceptance-init <specs_dir>
+python <plugin-root>/scripts/spec_progress.py acceptance-init <specs_dir> --mode adaptive
 ```
 
-The tool parses `tasks.md`, freezes the original task IDs, builds review units, and plans two agents per unit: first-wave review plus adversarial review. It writes `<specs_dir>/acceptance_state.json`.
+Omitting `--mode` selects `adaptive`. The tool freezes the original task IDs and task text, builds contiguous review units of at most three low-risk tasks, isolates high-risk tasks, and plans only the reviewers required by the selected mode. An unfinished legacy 0.2.x ledger resumes as `full`; an already accepted legacy ledger remains accepted.
 
-Review-unit rules are implemented by `spec_progress.py`:
+## State C: Independent Unit Review
 
-- high-risk tasks stand alone
-- low-risk tasks may group only with contiguous tasks under the same phase
-- grouped units contain at most three tasks
-- later rounds include only affected units
+Skip this state in `quick` mode. Otherwise, launch only planned `first_wave` agents. Before each launch, call `acceptance-start-agent` (or MCP `spec_acceptance_start_agent`). Each agent owns exactly one unit.
 
-## State C: First-Wave Review
+Every prompt must include:
 
-Spawn only the first-wave agents shown as planned by `acceptance-status`. Before each launch, call `acceptance-start-agent`/`spec_acceptance_start_agent`. Each agent owns exactly one review unit and must not edit files.
+- workflow type and approved artifacts
+- assigned task IDs and their frozen task text
+- relevant changed files, diffs, tests, logs, and verification evidence
+- checks for completeness, spec adherence, overbroad fallback, missing verification, regression risk, and unapproved behavior
+- the P0-P4 evidence standard and the PASS/ACTIONABLE_ISSUES rule above
 
-Each first-wave prompt must include:
-
-- The workflow type and relevant approved spec files
-- The assigned task IDs and task text from `tasks.md`
-- Relevant changed files, diffs, tests, logs, and verification results
-- A request to review completion, strict spec adherence, overbroad fallback, missing verification, regression risk, and unapproved behavior
-- The instruction to classify each finding as `P0`, `P1`, `P2`, `P3`, or `P4` with evidence; non-evidence-backed concerns must be reported as notes, not issues
-
-Each first-wave agent must return:
+Expected report:
 
 ```markdown
 ## Review Unit
@@ -116,71 +95,88 @@ Each first-wave agent must return:
 - Status: PASS | ACTIONABLE_ISSUES
 - Completion: [complete / incomplete with evidence]
 - Spec Adherence: [strict / deviation with evidence]
-- Over-Fallback: [none / present with evidence]
 - Verification: [sufficient / missing with evidence]
-- Issues: [numbered actionable findings with severity/evidence or n/a]
+- Issues: [P0-P4 findings with evidence or n/a]
 ```
 
-After each result, call `acceptance-complete-agent`. For every evidence-backed issue, call `acceptance-record-issue`. Wait for all first-wave agents before starting the second wave.
+For each agent, use this order:
 
-## State D: Adversarial Review
+1. Start the agent in the ledger.
+2. Receive the report.
+3. Record every finding with `acceptance-record-issue --agent <agent-id>` while the agent is running. P3/P4 findings are still recorded.
+4. Complete the agent with `PASS` or `ACTIONABLE_ISSUES`.
 
-Spawn only the planned adversarial agents for the current round. Each adversarial agent reviews the matching first-wave report, the same review unit, and the same spec evidence.
+The ledger refuses to finish when an `ACTIONABLE_ISSUES` result is not bound to at least one recorded issue.
 
-Each adversarial agent must:
+## State D: Conditional Adversarial Review
 
-- Challenge whether the first-wave review missed incomplete work, spec drift, over-fallback, weak tests, hidden regressions, or unsupported assumptions
-- Prefer concrete evidence over agreement
-- Assign severity `P0`-`P4` to any new issue
-- Return `PASS` only when no actionable challenge remains
+Launch only adversarial agents that appear as planned in `acceptance-status`. The state machine enforces that the matching first-wave reviewer finishes first.
 
-After each result, call `acceptance-complete-agent` and record any issues through `acceptance-record-issue`.
+An adversarial agent reviews the same unit, first-wave report, and evidence, and tries to disprove the apparent pass by checking missed work, spec drift, weak tests, hidden regressions, unsafe fallback, and unsupported assumptions. Record and complete its result in the same order as State C.
 
-## State E: Loop Until Clear
+Mode behavior:
 
-After a review round completes, call:
+- `adaptive`: high-risk units receive this reviewer immediately; a low-risk unit receives one only after its first-wave reviewer reports P0-P2 issues.
+- `full`: every unit receives one.
+- `quick`: none are planned.
+
+## State E: Fix And Delta Re-review
+
+After all currently planned review agents finish, run:
 
 ```bash
 python <plugin-root>/scripts/spec_progress.py acceptance-plan-fixes <specs_dir>
 ```
 
-This creates or refreshes `<specs_dir>/acceptance-fixes.md`. It must not modify `<specs_dir>/tasks.md`.
+The command updates `<specs_dir>/acceptance-fixes.md` without changing `tasks.md`:
 
-Fix policy:
+- P0-P2 findings become evidence-backed fixes.
+- P3/P4 findings become deferred advisories.
+- after two automatic fix batches, any further P0-P2 finding permanently blocks this ledger; the human must stop without accepting it or choose repair/reapproval followed by a fresh ledger.
 
-- rounds 1-3: plan fixes for all evidence-backed actionable issues
-- rounds 4-6: plan fixes only for `P0`, `P1`, and `P2`; defer `P3` and `P4`
-- after round 6: if any `P0`-`P2` remains, stop and request human decision
+Start and complete each planned fix with evidence. In a Git workflow, commit the repaired code and its acceptance-fix ledger update before re-review; the global reviewer must inspect a clean, committed business-code state. Then run:
 
-After fixes complete, call `acceptance-next-round`; it plans agents only for affected units. Do not rerun all original units unless the tool reports all units as affected.
-
-Stop when `acceptance-status` reports no pending agents, no pending fixes, and no unresolved issues. Then call `acceptance-finish`.
-
-## State F: Final Branch
-
-If `acceptance-finish` succeeds, output the final workflow completion result:
-
-```markdown
-## Spec workflow 完成结果
-
-- 流程：[Requirements-First / Design-First / Bugfix]
-- 规范：[已批准并执行的 spec 文件]
-- Tasks：[全部完成 / 人类批准跳过项]
-- 验证：[已运行的关键验证]
-- 结尾验收：通过
-- 最终结论：整个 Spec workflow 流程已完成。
+```bash
+python <plugin-root>/scripts/spec_progress.py acceptance-next-round <specs_dir>
 ```
 
-When the run is inside a git repository, close the delivery chain from `../spec-workflow/SKILL.md`'s `## Git Delivery Chain` after `acceptance-finish` succeeds:
+For `adaptive` and `full`, only affected units are reset and re-reviewed; unchanged passing units stay sealed. For `quick`, the next round runs a new global integration review. Repeat only while the automatic-fix limit permits it.
 
-- Commit the acceptance artifacts (`acceptance_state.json`, `acceptance-fixes.md`, and any fix commits) and push the `spec/<run-id>` branch.
-- Mark the PR ready for review with `gh pr ready`, then post the completion summary as a single `gh pr comment`.
-- Print the suggested merge and cleanup commands for the human to run — for example `gh pr merge --squash --delete-branch` and `git worktree remove <path>` — and never merge or remove the worktree autonomously. For high-risk workflows, repeat the deep-review warning before any merge.
-- Follow the degradation ladder: with no PR (no remote or `gh`), only print the local branch merge suggestion; outside a git repository, skip this entirely.
+## State F: Global Integration Review
 
-If issues remain:
+When all required unit reviewers pass and no issue, fix, or affected unit remains, the ledger plans one `GLOBAL` integration agent. In `quick` mode this is the only reviewer.
 
-- Summarize only actionable issues with evidence and affected task IDs.
-- Use `<specs_dir>/acceptance-fixes.md` as the fix queue.
-- Do not append these fixes to `<specs_dir>/tasks.md`.
-- After fixes complete, resume this acceptance flow with `acceptance-status`.
+The integration agent receives the approved artifacts, full task plan, combined diff, unit-review conclusions, and verification evidence. It checks cross-unit behavior, end-to-end spec coverage, interaction regressions, release/rollback risk, and whether the combined result still matches the approved baseline.
+
+Start and complete it through the same ledger commands. Record integration findings against unit `GLOBAL` and include the affected task IDs. A P0-P2 result returns to State E; after its targeted repairs and unit re-review, a new integration agent must pass.
+
+Finally run:
+
+```bash
+python <plugin-root>/scripts/spec_progress.py acceptance-finish <specs_dir>
+```
+
+The finish command fails closed unless all of these are true:
+
+- local pre-acceptance still passes and the approved baseline has not drifted
+- every mode-required unit reviewer passed in the unit's latest review round
+- every ACTIONABLE_ISSUES result is bound to recorded issue IDs
+- no agent or fix is pending/running
+- no issue is unresolved and no affected unit awaits re-review
+- the current global integration agent passed
+- the primary artifacts, `tasks.md`, `spec.yml`, reviewed Git commit, and non-ledger worktree content still match the integration review snapshot
+
+The stored snapshot represents the reviewed pre-finish state. `acceptance-finish` writes final ledger metadata only after this comparison succeeds.
+
+## State G: Final Branch
+
+If `acceptance-finish` succeeds, summarize the workflow type, approved specs, completed/skipped tasks, key verification, selected acceptance mode, and final result. Do not dump raw review transcripts.
+
+When the run is inside a git repository, close the delivery chain from `../spec-workflow/SKILL.md`:
+
+- ensure repair commits were already created before their re-review; after finish, commit the final acceptance-state-only update and push `spec/<run-id>`
+- mark the PR ready and post one concise completion summary
+- print merge and worktree-cleanup commands for the human; never merge or remove the worktree autonomously
+- if no remote or `gh` exists, keep the branch local and provide the appropriate local handoff
+
+If acceptance remains blocked, report only the evidence-backed P0-P2 findings, affected task IDs, automatic-fix rounds used, and the concrete decision needed next.

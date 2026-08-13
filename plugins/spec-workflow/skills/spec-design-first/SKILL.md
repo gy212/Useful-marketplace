@@ -143,7 +143,7 @@ Implementation rules:
 - Add or update tests that prove both design constraints and derived requirements.
 - If implementation conflicts with `design.md`, `requirements.md`, or the task plan in `tasks.md`, stop code work. Run `sync-check --write` to mark `reapproval-required`, return to State B, update specs, and wait for an accepted approval phrase plus a fresh `approve` before continuing. Progress fields may still be updated through the tools.
 - Run verification and perform at most three self-healing loops.
-- After verification passes and before `complete`, run a two-phase task review of the task's diff: (1) 规格符合性 — the diff implements exactly the selected task, nothing missing, nothing extra, and covers its `覆盖` requirement IDs; (2) 代码质量 — minimal change, real assertions, no weakened tests, consistent with the approved design boundary. Prefer a fresh review subagent that receives only the task text, the relevant spec excerpts, and the diff — not the main-session history; if subagents are unavailable, run the same checklist as an explicit self-review. Critical or Important findings block `complete`: fix and re-review. Record minor findings and the review verdict in the completion evidence.
+- After verification passes and before `complete`, run a lightweight two-phase self-check of the task diff: (1) 规格符合性 — exactly the selected task and its `覆盖` IDs; (2) 代码质量 — minimal change, real assertions, no weakened tests, consistent with the approved design boundary. Do not spawn a separate reviewer by default; final acceptance supplies fresh independent review. Use a fresh task-level reviewer only when this check exposes material uncertainty or the task has a critical risk that cannot safely wait for the final unit review. Critical or Important findings block `complete`; record the verdict in completion evidence.
 - After passing verification, call `spec_complete_task` through MCP or run `python <plugin-root>/scripts/spec_progress.py complete <specs_dir> T-xxx --evidence "<verification evidence>"`. Do not manually mark `- [x]` without recorded evidence.
 - If blocked, call `spec_block_task` or `python <plugin-root>/scripts/spec_progress.py block <specs_dir> T-xxx --reason "<reason>"`.
 - If skipped, call `spec_skip_task` or `python <plugin-root>/scripts/spec_progress.py skip <specs_dir> T-xxx --approval "<human approval evidence>"`.
@@ -158,6 +158,6 @@ Spec: <specs_dir>/tasks.md
 
   In a git repository, after `complete`, commit the business code and the progress files together with this message (this satisfies the pre-commit progress guard), push the `spec/<run-id>` branch, and refresh the PR checklist from `tasks.md` per the router's `## Git Delivery Chain` in `../spec-workflow/SKILL.md`. When the git chain is not enabled, just surface the suggested message as before.
 
-If unchecked tasks remain, ask whether to continue only after the current task is complete.
+If unchecked tasks remain, continue to the next executable task under the existing workflow approval. Pause only for a real blocker, a required reapproval, or a decision that materially changes scope or outcome.
 
 If no unchecked tasks remain in `<specs_dir>/tasks.md`, read and follow `../spec-acceptance/SKILL.md` before reporting the whole workflow complete.

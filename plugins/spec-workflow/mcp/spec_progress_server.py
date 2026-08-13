@@ -137,6 +137,15 @@ def _required_string(args: dict[str, Any], key: str) -> str:
     return raw
 
 
+def _optional_string(args: dict[str, Any], key: str) -> str | None:
+    raw = args.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise SpecProgressError(f"{key} must be a non-empty string when provided")
+    return raw
+
+
 TOOLS = [
     {
         "name": "spec_status",
@@ -240,16 +249,23 @@ TOOLS = [
     },
     {
         "name": "spec_acceptance_init",
-        "description": "Initialize resumable final acceptance state and planned review/adversarial agents.",
+        "description": "Initialize resumable quick, adaptive (default), or full acceptance review.",
         "inputSchema": {
             "type": "object",
-            "properties": {"specs_dir": {"type": "string"}},
+            "properties": {
+                "specs_dir": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["quick", "adaptive", "full"],
+                    "description": "Defaults to adaptive; quick is limited to low-risk workflows.",
+                },
+            },
             "required": ["specs_dir"],
         },
     },
     {
         "name": "spec_acceptance_status",
-        "description": "Return acceptance round, pending agents, issues, fixes, and affected units.",
+        "description": "Return acceptance mode, review/integration status, issues, fixes, and affected units.",
         "inputSchema": {
             "type": "object",
             "properties": {"specs_dir": {"type": "string"}},
@@ -273,10 +289,10 @@ TOOLS = [
             "properties": {
                 "specs_dir": {"type": "string"},
                 "agent_id": {"type": "string"},
-                "result": {"type": "string"},
+                "result": {"type": "string", "enum": ["PASS", "ACTIONABLE_ISSUES"]},
                 "report": {"type": "string"},
             },
-            "required": ["specs_dir", "agent_id", "result"],
+            "required": ["specs_dir", "agent_id", "result", "report"],
         },
     },
     {
@@ -298,7 +314,7 @@ TOOLS = [
     },
     {
         "name": "spec_acceptance_plan_fixes",
-        "description": "Create/update acceptance-fixes.md using the round policy.",
+        "description": "Plan P0-P2 fixes, defer P3-P4, and enforce the two automatic-fix-round limit.",
         "inputSchema": {
             "type": "object",
             "properties": {"specs_dir": {"type": "string"}},
@@ -329,7 +345,7 @@ TOOLS = [
     },
     {
         "name": "spec_acceptance_next_round",
-        "description": "Plan the next targeted acceptance round for affected units only.",
+        "description": "Plan delta re-review for affected units, then the global integration review.",
         "inputSchema": {
             "type": "object",
             "properties": {"specs_dir": {"type": "string"}},
@@ -338,7 +354,7 @@ TOOLS = [
     },
     {
         "name": "spec_acceptance_finish",
-        "description": "Mark final acceptance accepted when agents, fixes, and issues are resolved.",
+        "description": "Finish only after required reviewers, frozen artifacts, issues, fixes, and integration pass.",
         "inputSchema": {
             "type": "object",
             "properties": {"specs_dir": {"type": "string"}},
@@ -390,7 +406,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "spec_skip_task":
         return command_skip(_checked_specs_dir(args), _required_string(args, "task_id"), _required_string(args, "approval"))
     if name == "spec_acceptance_init":
-        return command_acceptance_init(_checked_specs_dir(args))
+        return command_acceptance_init(_checked_specs_dir(args), _optional_string(args, "mode"))
     if name == "spec_acceptance_status":
         return command_acceptance_status(_checked_specs_dir(args))
     if name == "spec_acceptance_start_agent":
@@ -400,7 +416,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
             _checked_specs_dir(args),
             _required_string(args, "agent_id"),
             _required_string(args, "result"),
-            args.get("report", ""),
+            _required_string(args, "report"),
         )
     if name == "spec_acceptance_record_issue":
         return command_acceptance_record_issue(
@@ -438,7 +454,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "spec-workflow-progress", "version": "0.2.2"},
+                "serverInfo": {"name": "spec-workflow-progress", "version": "0.3.0"},
             },
         )
     if method == "notifications/initialized":

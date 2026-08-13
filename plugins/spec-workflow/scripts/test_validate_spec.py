@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -397,6 +400,84 @@ def approve_progress(specs_dir: Path, evidence: str = "批准规范，启动执�
         raise AssertionError(result.stdout + result.stderr)
 
 
+def completed_feature_tasks(first_risk: str = "low") -> str:
+    tasks = valid_feature_tasks().replace("- [ ] **T-001:**", "- [x] **T-001:**")
+    tasks = tasks.replace("- 状态: pending", "- 状态: done", 1)
+    tasks = tasks.replace("- 验证证据: pending", "- 验证证据: pytest passed", 1)
+    return tasks.replace("- 风险: low", f"- 风险: {first_risk}", 1)
+
+
+def prepare_acceptance(specs_dir: Path, first_risk: str = "low") -> None:
+    make_requirements_first(specs_dir, tasks=completed_feature_tasks(first_risk))
+    init_progress(specs_dir)
+    approve_progress(specs_dir)
+
+
+def load_acceptance_state(specs_dir: Path) -> dict[str, object]:
+    return json.loads((specs_dir / "acceptance_state.json").read_text(encoding="utf-8"))
+
+
+def complete_acceptance_agent(
+    specs_dir: Path,
+    agent_id: str,
+    result: str = "PASS",
+) -> None:
+    start_acceptance_agent(specs_dir, agent_id)
+    finish_acceptance_agent(specs_dir, agent_id, result)
+
+
+def start_acceptance_agent(specs_dir: Path, agent_id: str) -> None:
+    started = run_progress("acceptance-start-agent", str(specs_dir), agent_id)
+    if started.returncode != 0:
+        raise AssertionError(started.stdout + started.stderr)
+
+
+def finish_acceptance_agent(
+    specs_dir: Path,
+    agent_id: str,
+    result: str = "PASS",
+) -> None:
+    completed = run_progress(
+        "acceptance-complete-agent",
+        str(specs_dir),
+        agent_id,
+        "--result",
+        result,
+        "--report",
+        f"{result} report",
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stdout + completed.stderr)
+
+
+def complete_actionable_agent(
+    specs_dir: Path,
+    agent_id: str,
+    unit_id: str,
+    *,
+    title: str = "Blocking review issue",
+    evidence: str = "evidence-backed P2 finding",
+) -> None:
+    start_acceptance_agent(specs_dir, agent_id)
+    recorded = run_progress(
+        "acceptance-record-issue",
+        str(specs_dir),
+        "--unit",
+        unit_id,
+        "--severity",
+        "P2",
+        "--title",
+        title,
+        "--evidence",
+        evidence,
+        "--agent",
+        agent_id,
+    )
+    if recorded.returncode != 0:
+        raise AssertionError(recorded.stdout + recorded.stderr)
+    finish_acceptance_agent(specs_dir, agent_id, "ACTIONABLE_ISSUES")
+
+
 def make_design_first(specs_dir: Path, design: str | None = None) -> None:
     write(specs_dir / "design.md", design or valid_design())
     write(specs_dir / "requirements.md", valid_requirements())
@@ -614,6 +695,51 @@ class ValidatorRegressionTests(unittest.TestCase):
             self.assertNotEqual(start.returncode, 0)
             self.assertIn("baseline drift", start.stderr)
 
+    def test_approved_hashes_ignore_checkout_line_endings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            make_requirements_first(specs_dir)
+            init_progress(specs_dir)
+            approve_progress(specs_dir)
+            for name in ("product.md", "architecture.md"):
+                path = specs_dir / name
+                normalized = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                path.write_bytes(normalized.replace(b"\n", b"\r\n"))
+
+            sync = run_progress("sync-check", str(specs_dir))
+
+            self.assertEqual(sync.returncode, 0, sync.stdout + sync.stderr)
+
+    def test_sync_check_accepts_legacy_raw_crlf_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            make_requirements_first(specs_dir)
+            init_progress(specs_dir)
+            for name in ("product.md", "architecture.md"):
+                path = specs_dir / name
+                normalized = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                path.write_bytes(normalized.replace(b"\n", b"\r\n"))
+            approve_progress(specs_dir)
+            index = (specs_dir / "spec.yml").read_text(encoding="utf-8")
+            raw_hashes = ", ".join(
+                f"{name}={hashlib.sha256((specs_dir / name).read_bytes()).hexdigest()[:12]}"
+                for name in ("product.md", "architecture.md")
+            )
+            index = re.sub(
+                r"^artifact_hashes:.*$",
+                f"artifact_hashes: {raw_hashes}",
+                index,
+                flags=re.MULTILINE,
+            )
+            (specs_dir / "spec.yml").write_text(index, encoding="utf-8")
+            for name in ("product.md", "architecture.md"):
+                path = specs_dir / name
+                path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n"))
+
+            sync = run_progress("sync-check", str(specs_dir))
+
+            self.assertEqual(sync.returncode, 0, sync.stdout + sync.stderr)
+
     def test_approved_task_plan_drift_blocks_sync_and_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             specs_dir = Path(tmp)
@@ -698,89 +824,244 @@ class ValidatorRegressionTests(unittest.TestCase):
     def test_acceptance_state_recovers_pending_agents_after_partial_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             specs_dir = Path(tmp)
-            tasks = valid_feature_tasks().replace("- [ ] **T-001:**", "- [x] **T-001:**")
-            tasks = tasks.replace("- 状态: pending", "- 状态: done", 1)
-            tasks = tasks.replace("- 验证证据: pending", "- 验证证据: pytest passed", 1)
-            make_requirements_first(specs_dir, tasks=tasks)
-            init_progress(specs_dir)
+            prepare_acceptance(specs_dir)
 
             init = run_progress("acceptance-init", str(specs_dir))
             self.assertEqual(init.returncode, 0, init.stdout + init.stderr)
-            state = json.loads((specs_dir / "acceptance_state.json").read_text(encoding="utf-8"))
+            state = load_acceptance_state(specs_dir)
             first_agent = state["agents"][0]["agent_id"]
-            self.assertEqual(run_progress("acceptance-start-agent", str(specs_dir), first_agent).returncode, 0)
-            completed = run_progress(
-                "acceptance-complete-agent",
-                str(specs_dir),
-                first_agent,
-                "--result",
-                "PASS",
-                "--report",
-                "unit passed",
-            )
+            complete_acceptance_agent(specs_dir, first_agent)
             status = run_progress("acceptance-status", str(specs_dir))
 
-            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
             summary = json.loads(status.stdout)
             self.assertNotIn(first_agent, summary["agents"]["pending_or_running"])
             self.assertGreater(len(summary["agents"]["pending_or_running"]), 0)
+            self.assertEqual(summary["integration_review"]["status"], "planned")
+
+    def test_acceptance_modes_plan_only_required_agents(self) -> None:
+        cases = [
+            (None, "adaptive", {"first_wave"}),
+            ("quick", "quick", {"integration"}),
+            ("adaptive", "adaptive", {"first_wave"}),
+            ("full", "full", {"first_wave", "adversarial"}),
+        ]
+        for requested, expected, roles in cases:
+            with self.subTest(mode=requested or "default"), tempfile.TemporaryDirectory() as tmp:
+                specs_dir = Path(tmp)
+                prepare_acceptance(specs_dir)
+                args = ["acceptance-init", str(specs_dir)]
+                if requested:
+                    args.extend(["--mode", requested])
+
+                initialized = run_progress(*args)
+                state = load_acceptance_state(specs_dir)
+
+                self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+                self.assertEqual(state["schema_version"], 2)
+                self.assertEqual(state["acceptance_mode"], expected)
+                self.assertEqual({agent["role"] for agent in state["agents"]}, roles)
+                self.assertEqual(state["max_auto_fix_rounds"], 2)
+
+    def test_legacy_v1_acceptance_resumes_as_full(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(
+                run_progress("acceptance-init", str(specs_dir), "--mode", "full").returncode,
+                0,
+            )
+            state = load_acceptance_state(specs_dir)
+            state["schema_version"] = 1
+            state.pop("acceptance_mode")
+            state.pop("max_auto_fix_rounds")
+            state.pop("auto_fix_rounds")
+            for unit in state["review_units"]:
+                unit.pop("requires_adversarial")
+            (specs_dir / "acceptance_state.json").write_text(
+                json.dumps(state, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            status = run_progress("acceptance-status", str(specs_dir))
+
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            self.assertEqual(json.loads(status.stdout)["acceptance_mode"], "full")
+
+    def test_legacy_v1_acceptance_preserves_used_fix_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            state = load_acceptance_state(specs_dir)
+            state["schema_version"] = 1
+            state.pop("acceptance_mode")
+            state.pop("max_auto_fix_rounds")
+            state.pop("auto_fix_rounds")
+            state["fixes"] = [
+                {"fix_id": "F-001", "round": 1, "status": "done", "issue_ids": []},
+                {"fix_id": "F-002", "round": 2, "status": "done", "issue_ids": []},
+            ]
+            (specs_dir / "acceptance_state.json").write_text(
+                json.dumps(state, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            status = run_progress("acceptance-status", str(specs_dir))
+
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            self.assertEqual(json.loads(status.stdout)["automatic_fix_rounds"]["used"], 2)
+
+    def test_adaptive_uses_adversarial_review_for_risk_or_primary_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir, first_risk="high")
+            initialized = run_progress("acceptance-init", str(specs_dir), "--mode", "adaptive")
+            state = load_acceptance_state(specs_dir)
+
+            self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+            high_unit = next(unit for unit in state["review_units"] if unit["high_risk"])
+            low_unit = next(unit for unit in state["review_units"] if not unit["high_risk"])
+            high_roles = {
+                agent["role"] for agent in state["agents"] if agent["unit_id"] == high_unit["unit_id"]
+            }
+            low_roles = {
+                agent["role"] for agent in state["agents"] if agent["unit_id"] == low_unit["unit_id"]
+            }
+            self.assertEqual(high_roles, {"first_wave", "adversarial"})
+            self.assertEqual(low_roles, {"first_wave"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            state = load_acceptance_state(specs_dir)
+            primary = state["agents"][0]["agent_id"]
+
+            complete_actionable_agent(specs_dir, primary, "U-001")
+            state = load_acceptance_state(specs_dir)
+
+            self.assertEqual(
+                [agent["role"] for agent in state["agents"]],
+                ["first_wave", "adversarial"],
+            )
+
+    def test_quick_acceptance_rejects_non_low_risk_workflows(self) -> None:
+        for risk in ("medium", "high", "critical"):
+            with self.subTest(risk=risk), tempfile.TemporaryDirectory() as tmp:
+                specs_dir = Path(tmp)
+                prepare_acceptance(specs_dir, first_risk=risk)
+
+                result = run_progress("acceptance-init", str(specs_dir), "--mode", "quick")
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("limited to low-risk", result.stderr)
+
+    def test_acceptance_freezes_blockquote_task_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            initialized = run_progress("acceptance-init", str(specs_dir), "--mode", "quick")
+            self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+            tasks = (specs_dir / "tasks.md").read_text(encoding="utf-8")
+            tasks += "\n> **Security override:** disable authentication\n"
+            (specs_dir / "tasks.md").write_text(tasks, encoding="utf-8")
+
+            status = run_progress("acceptance-status", str(specs_dir))
+
+            self.assertNotEqual(status.returncode, 0)
+            self.assertIn("tasks.md file changed", status.stderr)
 
     def test_acceptance_fixes_do_not_append_original_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             specs_dir = Path(tmp)
-            tasks = valid_feature_tasks().replace("- [ ] **T-001:**", "- [x] **T-001:**")
-            tasks = tasks.replace("- 状态: pending", "- 状态: done", 1)
-            tasks = tasks.replace("- 验证证据: pending", "- 验证证据: pytest passed", 1)
-            make_requirements_first(specs_dir, tasks=tasks)
-            init_progress(specs_dir)
+            prepare_acceptance(specs_dir)
             self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            state = load_acceptance_state(specs_dir)
+            primary = state["agents"][0]["agent_id"]
             before = (specs_dir / "tasks.md").read_text(encoding="utf-8")
-            issue = run_progress(
-                "acceptance-record-issue",
-                str(specs_dir),
-                "--unit",
+            complete_actionable_agent(
+                specs_dir,
+                primary,
                 "U-001",
-                "--severity",
-                "P2",
-                "--title",
-                "Missing regression proof",
-                "--evidence",
-                "review report showed missing regression proof",
+                title="Missing regression proof",
+                evidence="review report showed missing regression proof",
             )
+            state = load_acceptance_state(specs_dir)
+            adversarial = next(agent["agent_id"] for agent in state["agents"] if agent["role"] == "adversarial")
+            complete_acceptance_agent(specs_dir, adversarial)
             planned = run_progress("acceptance-plan-fixes", str(specs_dir))
             after = (specs_dir / "tasks.md").read_text(encoding="utf-8")
 
-            self.assertEqual(issue.returncode, 0, issue.stdout + issue.stderr)
             self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
             self.assertEqual(before, after)
             self.assertTrue((specs_dir / "acceptance-fixes.md").is_file())
             self.assertIn("F-001", (specs_dir / "acceptance-fixes.md").read_text(encoding="utf-8"))
 
-    def test_acceptance_round_four_defers_p3_and_fixes_p2_only(self) -> None:
+    def test_acceptance_rechecks_only_affected_units_after_fix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             specs_dir = Path(tmp)
-            tasks = valid_feature_tasks().replace("- [ ] **T-001:**", "- [x] **T-001:**")
-            tasks = tasks.replace("- 状态: pending", "- 状态: done", 1)
-            tasks = tasks.replace("- 验证证据: pending", "- 验证证据: pytest passed", 1)
-            make_requirements_first(specs_dir, tasks=tasks)
-            init_progress(specs_dir)
+            prepare_acceptance(specs_dir, first_risk="high")
             self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
-            state = json.loads((specs_dir / "acceptance_state.json").read_text(encoding="utf-8"))
-            state["round"] = 4
-            (specs_dir / "acceptance_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            state = load_acceptance_state(specs_dir)
+            high_unit = next(unit for unit in state["review_units"] if unit["high_risk"])
+            low_unit = next(unit for unit in state["review_units"] if not unit["high_risk"])
+            high_primary = next(
+                agent["agent_id"] for agent in state["agents"]
+                if agent["unit_id"] == high_unit["unit_id"] and agent["role"] == "first_wave"
+            )
+            high_adversarial = next(
+                agent["agent_id"] for agent in state["agents"]
+                if agent["unit_id"] == high_unit["unit_id"] and agent["role"] == "adversarial"
+            )
+            low_primary = next(
+                agent["agent_id"] for agent in state["agents"]
+                if agent["unit_id"] == low_unit["unit_id"] and agent["role"] == "first_wave"
+            )
+            complete_acceptance_agent(specs_dir, high_primary)
+            complete_acceptance_agent(specs_dir, high_adversarial)
+            complete_actionable_agent(
+                specs_dir,
+                low_primary,
+                low_unit["unit_id"],
+                title="Low unit regression",
+                evidence="focused test fails",
+            )
+            state = load_acceptance_state(specs_dir)
+            low_adversarial = next(
+                agent["agent_id"] for agent in state["agents"]
+                if agent["unit_id"] == low_unit["unit_id"] and agent["role"] == "adversarial"
+            )
+            complete_acceptance_agent(specs_dir, low_adversarial)
+            self.assertEqual(run_progress("acceptance-plan-fixes", str(specs_dir)).returncode, 0)
+            fix_id = load_acceptance_state(specs_dir)["fixes"][0]["fix_id"]
+            self.assertEqual(run_progress("acceptance-fix-start", str(specs_dir), fix_id).returncode, 0)
             self.assertEqual(run_progress(
-                "acceptance-record-issue",
+                "acceptance-fix-complete",
                 str(specs_dir),
-                "--unit",
-                "U-001",
-                "--severity",
-                "P2",
-                "--title",
-                "Blocking issue",
+                fix_id,
                 "--evidence",
-                "evidence for p2",
+                "focused test passed",
             ).returncode, 0)
+
+            next_round = run_progress("acceptance-next-round", str(specs_dir))
+            state = load_acceptance_state(specs_dir)
+            round_two = [agent for agent in state["agents"] if agent["round"] == 2]
+
+            self.assertEqual(next_round.returncode, 0, next_round.stdout + next_round.stderr)
+            self.assertEqual({agent["unit_id"] for agent in round_two}, {low_unit["unit_id"]})
+            self.assertEqual({agent["role"] for agent in round_two}, {"first_wave", "adversarial"})
+            updated_high = next(unit for unit in state["review_units"] if unit["unit_id"] == high_unit["unit_id"])
+            self.assertEqual(updated_high["round_started"], 1)
+
+    def test_acceptance_defers_p3_and_stops_after_two_automatic_fix_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            state = load_acceptance_state(specs_dir)
+            primary = state["agents"][0]["agent_id"]
+            complete_acceptance_agent(specs_dir, primary)
             self.assertEqual(run_progress(
                 "acceptance-record-issue",
                 str(specs_dir),
@@ -792,13 +1073,45 @@ class ValidatorRegressionTests(unittest.TestCase):
                 "Non-blocking polish",
                 "--evidence",
                 "evidence for p3",
+                "--agent",
+                primary,
             ).returncode, 0)
             planned = run_progress("acceptance-plan-fixes", str(specs_dir))
 
             self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
-            state = json.loads((specs_dir / "acceptance_state.json").read_text(encoding="utf-8"))
-            self.assertEqual([fix["severity"] for fix in state["fixes"]], ["P2"])
+            state = load_acceptance_state(specs_dir)
+            self.assertEqual(state["fixes"], [])
             self.assertEqual([issue["severity"] for issue in state["deferred_issues"]], ["P3"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            state = load_acceptance_state(specs_dir)
+            primary = state["agents"][0]["agent_id"]
+            complete_actionable_agent(
+                specs_dir,
+                primary,
+                "U-001",
+                title="Blocking issue",
+                evidence="evidence for p2",
+            )
+            state = load_acceptance_state(specs_dir)
+            adversarial = next(agent["agent_id"] for agent in state["agents"] if agent["role"] == "adversarial")
+            complete_acceptance_agent(specs_dir, adversarial)
+            state = load_acceptance_state(specs_dir)
+            state["auto_fix_rounds"] = 2
+            (specs_dir / "acceptance_state.json").write_text(
+                json.dumps(state, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            stopped = run_progress("acceptance-plan-fixes", str(specs_dir))
+            state = load_acceptance_state(specs_dir)
+
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertEqual(state["status"], "blocked")
+            self.assertEqual(state["fixes"], [])
 
     def test_task_graph_blocks_unmet_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -860,15 +1173,11 @@ class ValidatorRegressionTests(unittest.TestCase):
     def test_pre_acceptance_is_not_final_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             specs_dir = Path(tmp)
-            tasks = valid_feature_tasks().replace("- [ ] **T-001:**", "- [x] **T-001:**")
-            tasks = tasks.replace("- 状态: pending", "- 状态: done", 1)
-            tasks = tasks.replace("- 验证证据: pending", "- 验证证据: pytest passed", 1)
-            make_requirements_first(specs_dir, tasks=tasks)
-            init_progress(specs_dir)
+            prepare_acceptance(specs_dir)
             result = run_progress("pre-acceptance", str(specs_dir))
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("strict multi-agent final acceptance is still required", result.stdout)
+            self.assertIn("adaptive final acceptance is still required", result.stdout)
 
     def test_guard_commit_honors_non_default_specs_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -899,7 +1208,12 @@ class ValidatorRegressionTests(unittest.TestCase):
             make_requirements_first(specs_dir)
             init_progress(specs_dir)
             subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
             (specs_dir / "tasks.md").write_text(valid_feature_tasks() + "\n", encoding="utf-8")
 
             result = run_progress("resume", str(specs_dir), cwd=repo)
@@ -975,32 +1289,38 @@ class ValidatorRegressionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("git is unavailable", result.stdout)
 
-    def test_discover_distinguishes_open_and_completed_workflows(self) -> None:
+    def test_discover_keeps_done_but_unaccepted_workflows_open(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             specs_root = repo / "docs" / "specs"
             open_dir = specs_root / "20260615-100000-open"
             done_dir = specs_root / "20260615-100001-done"
+            accepted_dir = specs_root / "20260615-100002-accepted"
             open_dir.mkdir(parents=True)
             done_dir.mkdir(parents=True)
+            accepted_dir.mkdir(parents=True)
             make_requirements_first(open_dir)
             init_progress(open_dir)
-            done_tasks = valid_feature_tasks().replace("- [ ] **T-001:**", "- [x] **T-001:**")
-            done_tasks = done_tasks.replace("- 状态: pending", "- 状态: done", 1)
-            done_tasks = done_tasks.replace("- 验证证据: pending", "- 验证证据: pytest passed", 1)
-            make_requirements_first(done_dir, tasks=done_tasks)
-            init_progress(done_dir)
+            prepare_acceptance(done_dir)
+            prepare_acceptance(accepted_dir)
+            self.assertEqual(
+                run_progress("acceptance-init", str(accepted_dir), "--mode", "quick").returncode,
+                0,
+            )
+            integration = load_acceptance_state(accepted_dir)["agents"][0]["agent_id"]
+            complete_acceptance_agent(accepted_dir, integration)
+            self.assertEqual(run_progress("acceptance-finish", str(accepted_dir)).returncode, 0)
 
             result = run_progress("discover", "docs/specs", cwd=repo)
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["workflow_count"], 2)
-            self.assertEqual(payload["open_count"], 1)
-            self.assertEqual(payload["open_workflows"][0]["specs_dir"], "docs/specs/20260615-100000-open")
+            self.assertEqual(payload["workflow_count"], 3)
+            self.assertEqual(payload["open_count"], 2)
             records = {item["run_id"]: item for item in payload["workflows"]}
             self.assertTrue(records["20260615-100000-open"]["open"])
-            self.assertFalse(records["20260615-100001-done"]["open"])
+            self.assertTrue(records["20260615-100001-done"]["open"])
+            self.assertFalse(records["20260615-100002-accepted"]["open"])
 
     def test_new_workflow_creates_unique_sanitized_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1087,8 +1407,17 @@ class ValidatorRegressionTests(unittest.TestCase):
         claude_manifest = json.loads(
             (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(codex_manifest["version"], "0.2.2")
-        self.assertEqual(claude_manifest["version"], "0.2.2")
+        self.assertEqual(codex_manifest["version"], "0.3.0")
+        self.assertEqual(claude_manifest["version"], "0.3.0")
+        repo_root = PLUGIN_ROOT.parents[1]
+        agents_marketplace = json.loads(
+            (repo_root / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
+        )
+        claude_marketplace = json.loads(
+            (repo_root / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(agents_marketplace["plugins"][0]["version"], "0.3.0")
+        self.assertEqual(claude_marketplace["plugins"][0]["version"], "0.3.0")
         self.assertIn("explicit", codex_manifest["description"].lower())
         self.assertTrue(
             all(prompt.startswith("Use spec-workflow") for prompt in codex_manifest["interface"]["defaultPrompt"])
@@ -1255,11 +1584,19 @@ class ValidatorRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         replies = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        initialize_reply = next(reply for reply in replies if reply.get("id") == 1)
         tools_reply = next(reply for reply in replies if reply.get("id") == 2)
-        names = {tool["name"] for tool in tools_reply["result"]["tools"]}
+        tools = tools_reply["result"]["tools"]
+        names = {tool["name"] for tool in tools}
         self.assertIn("spec_approve", names)
         self.assertIn("spec_discover_workflows", names)
         self.assertIn("spec_new_workflow", names)
+        acceptance_init = next(tool for tool in tools if tool["name"] == "spec_acceptance_init")
+        self.assertEqual(
+            acceptance_init["inputSchema"]["properties"]["mode"]["enum"],
+            ["quick", "adaptive", "full"],
+        )
+        self.assertEqual(initialize_reply["result"]["serverInfo"]["version"], "0.3.0")
 
     def test_plugin_manifests_register_mcp_idle_timeout(self) -> None:
         codex_manifest = json.loads(
@@ -1431,40 +1768,378 @@ class ValidatorRegressionTests(unittest.TestCase):
         self.assertIn("evidence is required", error_reply["error"]["message"])
         self.assertNotIn('"id": null', result.stdout)
 
-    def test_acceptance_full_happy_path_finishes(self) -> None:
+    def test_acceptance_adaptive_happy_path_requires_global_integration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             specs_dir = Path(tmp)
-            tasks = valid_feature_tasks().replace("- [ ] **T-001:**", "- [x] **T-001:**")
-            tasks = tasks.replace("- 状态: pending", "- 状态: done", 1)
-            tasks = tasks.replace("- 验证证据: pending", "- 验证证据: pytest passed", 1)
-            make_requirements_first(specs_dir, tasks=tasks)
-            init_progress(specs_dir)
+            prepare_acceptance(specs_dir)
             init = run_progress("acceptance-init", str(specs_dir))
             self.assertEqual(init.returncode, 0, init.stdout + init.stderr)
-            state = json.loads((specs_dir / "acceptance_state.json").read_text(encoding="utf-8"))
+            state = load_acceptance_state(specs_dir)
 
             for agent in list(state["agents"]):
-                start = run_progress("acceptance-start-agent", str(specs_dir), agent["agent_id"])
-                complete = run_progress(
-                    "acceptance-complete-agent",
-                    str(specs_dir),
-                    agent["agent_id"],
-                    "--result",
-                    "PASS",
-                    "--report",
-                    "pass",
-                )
-                self.assertEqual(start.returncode, 0, start.stdout + start.stderr)
-                self.assertEqual(complete.returncode, 0, complete.stdout + complete.stderr)
+                complete_acceptance_agent(specs_dir, agent["agent_id"])
 
-            next_round = run_progress("acceptance-next-round", str(specs_dir))
+            state = load_acceptance_state(specs_dir)
+            integration = next(agent for agent in state["agents"] if agent["role"] == "integration")
+            early_finish = run_progress("acceptance-finish", str(specs_dir))
+            self.assertNotEqual(early_finish.returncode, 0)
+            self.assertIn("global integration review has not passed", early_finish.stderr)
+
+            complete_acceptance_agent(specs_dir, integration["agent_id"])
             finish = run_progress("acceptance-finish", str(specs_dir))
-            state = json.loads((specs_dir / "acceptance_state.json").read_text(encoding="utf-8"))
+            resumed = run_progress("acceptance-status", str(specs_dir))
+            state = load_acceptance_state(specs_dir)
 
-            self.assertEqual(next_round.returncode, 0, next_round.stdout + next_round.stderr)
             self.assertEqual(finish.returncode, 0, finish.stdout + finish.stderr)
+            self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
             self.assertEqual(state["status"], "accepted")
             self.assertIn("Accepted", (specs_dir / "progress.md").read_text(encoding="utf-8"))
+            after_finish = run_progress("acceptance-next-round", str(specs_dir))
+            self.assertNotEqual(after_finish.returncode, 0)
+            self.assertEqual(load_acceptance_state(specs_dir)["status"], "accepted")
+
+    def test_acceptance_agent_rejects_unbound_actionable_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            state = load_acceptance_state(specs_dir)
+            primary = state["agents"][0]["agent_id"]
+            start_acceptance_agent(specs_dir, primary)
+            completed = run_progress(
+                "acceptance-complete-agent",
+                str(specs_dir),
+                primary,
+                "--result",
+                "ACTIONABLE_ISSUES",
+                "--report",
+                "claims an issue but records none",
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("requires at least one recorded P0-P2", completed.stderr)
+            self.assertEqual(load_acceptance_state(specs_dir)["agents"][0]["status"], "running")
+
+    def test_acceptance_actionable_result_rejects_p3_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            primary = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            start_acceptance_agent(specs_dir, primary)
+            self.assertEqual(run_progress(
+                "acceptance-record-issue",
+                str(specs_dir),
+                "--unit",
+                "U-001",
+                "--severity",
+                "P3",
+                "--title",
+                "Advisory polish",
+                "--evidence",
+                "non-blocking evidence",
+                "--agent",
+                primary,
+            ).returncode, 0)
+
+            completed = run_progress(
+                "acceptance-complete-agent",
+                str(specs_dir),
+                primary,
+                "--result",
+                "ACTIONABLE_ISSUES",
+                "--report",
+                "only a P3 advisory",
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("P3-P4 advisories", completed.stderr)
+
+    def test_acceptance_finish_rechecks_reviewed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            primary = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            complete_acceptance_agent(specs_dir, primary)
+            integration = next(
+                agent["agent_id"]
+                for agent in load_acceptance_state(specs_dir)["agents"]
+                if agent["role"] == "integration"
+            )
+            complete_acceptance_agent(specs_dir, integration)
+            frozen_index = (specs_dir / "spec.yml").read_text(encoding="utf-8")
+            write(specs_dir / "product.md", valid_product() + "\nChanged after review")
+
+            finish = run_progress("acceptance-finish", str(specs_dir))
+
+            self.assertNotEqual(finish.returncode, 0)
+            self.assertIn("changed since last approved index", finish.stderr)
+            self.assertEqual((specs_dir / "spec.yml").read_text(encoding="utf-8"), frozen_index)
+
+    def test_acceptance_finish_rejects_a_clean_commit_after_integration_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            specs_dir = repo / "docs" / "specs" / "run"
+            specs_dir.mkdir(parents=True)
+            prepare_acceptance(specs_dir)
+            write(repo / "app.py", "print('reviewed')")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(run_progress("acceptance-init", str(specs_dir)).returncode, 0)
+            primary = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            complete_acceptance_agent(specs_dir, primary)
+            integration = next(
+                agent["agent_id"]
+                for agent in load_acceptance_state(specs_dir)["agents"]
+                if agent["role"] == "integration"
+            )
+            complete_acceptance_agent(specs_dir, integration)
+            write(repo / "app.py", "print('changed after review')")
+            subprocess.run(["git", "add", "app.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "late change"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            finish = run_progress("acceptance-finish", str(specs_dir))
+
+            self.assertNotEqual(finish.returncode, 0)
+            self.assertIn("changed after global integration review", finish.stderr)
+
+    def test_global_integration_restarts_when_commit_changes_while_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            specs_dir = repo / "docs" / "specs" / "run"
+            specs_dir.mkdir(parents=True)
+            prepare_acceptance(specs_dir)
+            write(repo / "app.py", "print('reviewed')")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                run_progress("acceptance-init", str(specs_dir), "--mode", "quick").returncode,
+                0,
+            )
+            integration = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            start_acceptance_agent(specs_dir, integration)
+            write(repo / "app.py", "print('not reviewed')")
+            subprocess.run(["git", "add", "app.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "late change"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            completed = run_progress(
+                "acceptance-complete-agent",
+                str(specs_dir),
+                integration,
+                "--result",
+                "PASS",
+                "--report",
+                "reviewed the baseline commit",
+            )
+            state = load_acceptance_state(specs_dir)
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("changed while the global integration review was running", completed.stderr)
+            self.assertEqual(state["agents"][0]["status"], "planned")
+            self.assertEqual(state["status"], "integration-planned")
+
+    def test_untracked_spec_directory_does_not_hash_acceptance_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            write(repo / "app.py", "print('baseline')")
+            subprocess.run(["git", "add", "app.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            specs_dir = repo / "docs" / "specs" / "run"
+            specs_dir.mkdir(parents=True)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(
+                run_progress("acceptance-init", str(specs_dir), "--mode", "quick").returncode,
+                0,
+            )
+            integration = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+
+            complete_acceptance_agent(specs_dir, integration)
+            finish = run_progress("acceptance-finish", str(specs_dir))
+
+            self.assertEqual(finish.returncode, 0, finish.stdout + finish.stderr)
+            self.assertEqual(load_acceptance_state(specs_dir)["status"], "accepted")
+
+    def test_custom_specs_dir_can_complete_global_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            specs_dir = repo / "custom-specs" / "run"
+            specs_dir.mkdir(parents=True)
+            prepare_acceptance(specs_dir)
+            write(repo / "app.py", "print('baseline')")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            initialized = run_progress("acceptance-init", str(specs_dir), "--mode", "quick")
+            self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+            subprocess.run(["git", "add", "custom-specs/run/acceptance_state.json"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "acceptance plan"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            integration = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+
+            complete_acceptance_agent(specs_dir, integration)
+            finish = run_progress("acceptance-finish", str(specs_dir))
+
+            self.assertEqual(finish.returncode, 0, finish.stdout + finish.stderr)
+            self.assertEqual(load_acceptance_state(specs_dir)["status"], "accepted")
+
+    def test_finish_failure_stays_discoverable_and_can_resume(self) -> None:
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import spec_progress
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            specs_root = repo / "docs" / "specs"
+            specs_dir = specs_root / "run"
+            specs_dir.mkdir(parents=True)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(
+                run_progress("acceptance-init", str(specs_dir), "--mode", "quick").returncode,
+                0,
+            )
+            integration = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            complete_acceptance_agent(specs_dir, integration)
+            original_save = spec_progress.save_acceptance_state
+
+            def fail_accepted_save(path: str | Path, state: dict[str, object]) -> None:
+                if state.get("status") == "accepted":
+                    raise spec_progress.SpecProgressError("injected final ledger failure")
+                original_save(path, state)
+
+            with mock.patch.object(spec_progress, "save_acceptance_state", side_effect=fail_accepted_save):
+                with self.assertRaisesRegex(spec_progress.SpecProgressError, "injected final ledger failure"):
+                    spec_progress.command_acceptance_finish(specs_dir)
+
+            discovery = spec_progress.command_discover(specs_root)
+            self.assertEqual(load_acceptance_state(specs_dir)["status"], "finalizing")
+            self.assertEqual(discovery["open_count"], 1)
+
+            resumed = spec_progress.command_acceptance_finish(specs_dir)
+            self.assertEqual(resumed["status"], "accepted")
+            self.assertEqual(spec_progress.command_discover(specs_root)["open_count"], 0)
+
+    def test_accepted_legacy_ledger_reconciles_terminal_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs_dir = Path(tmp)
+            prepare_acceptance(specs_dir)
+            self.assertEqual(
+                run_progress("acceptance-init", str(specs_dir), "--mode", "quick").returncode,
+                0,
+            )
+            integration = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            complete_acceptance_agent(specs_dir, integration)
+            self.assertEqual(run_progress("acceptance-finish", str(specs_dir)).returncode, 0)
+            state = load_acceptance_state(specs_dir)
+            state["schema_version"] = 1
+            state.pop("acceptance_mode")
+            (specs_dir / "acceptance_state.json").write_text(
+                json.dumps(state, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            progress = (specs_dir / "progress.md").read_text(encoding="utf-8")
+            (specs_dir / "progress.md").write_text(
+                progress.replace("> **Status:** Accepted", "> **Status:** Completed"),
+                encoding="utf-8",
+            )
+
+            finish = run_progress("acceptance-finish", str(specs_dir))
+
+            self.assertEqual(finish.returncode, 0, finish.stdout + finish.stderr)
+            self.assertEqual(load_acceptance_state(specs_dir)["status"], "accepted")
+            self.assertIn("> **Status:** Accepted", (specs_dir / "progress.md").read_text(encoding="utf-8"))
+
+    def test_global_integration_rejects_dirty_business_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            specs_dir = repo / "docs" / "specs" / "run"
+            specs_dir.mkdir(parents=True)
+            prepare_acceptance(specs_dir)
+            write(repo / "app.py", "print('baseline')")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                run_progress("acceptance-init", str(specs_dir), "--mode", "quick").returncode,
+                0,
+            )
+            integration = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            write(repo / "app.py", "print('dirty')")
+
+            started = run_progress("acceptance-start-agent", str(specs_dir), integration)
+
+            self.assertNotEqual(started.returncode, 0)
+            self.assertIn("clean pre-acceptance state", started.stderr)
+
+    def test_acceptance_finish_rejects_dirty_docs_after_integration_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            specs_dir = repo / "docs" / "specs" / "run"
+            specs_dir.mkdir(parents=True)
+            prepare_acceptance(specs_dir)
+            write(repo / "README.md", "reviewed documentation")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Spec Test", "-c", "user.email=spec@example.invalid", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                run_progress("acceptance-init", str(specs_dir), "--mode", "quick").returncode,
+                0,
+            )
+            integration = load_acceptance_state(specs_dir)["agents"][0]["agent_id"]
+            complete_acceptance_agent(specs_dir, integration)
+            write(repo / "README.md", "changed after review")
+
+            finish = run_progress("acceptance-finish", str(specs_dir))
+
+            self.assertNotEqual(finish.returncode, 0)
+            self.assertIn("changed after global integration review", finish.stderr)
 
 
 if __name__ == "__main__":

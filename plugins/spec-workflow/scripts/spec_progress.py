@@ -96,12 +96,13 @@ VALID_APPROVAL_STATES = {"pending", "approved", "reapproval-required"}
 DEFAULT_SPECS_ROOT = Path("docs") / "specs"
 ACCEPTANCE_STATE_FILE = "acceptance_state.json"
 ACCEPTANCE_FIXES_FILE = "acceptance-fixes.md"
-ACCEPTANCE_AGENT_ROLES = {"first_wave", "adversarial"}
 ACCEPTANCE_AGENT_RESULTS = {"PASS", "ACTIONABLE_ISSUES"}
 ACCEPTANCE_SEVERITIES = {"P0", "P1", "P2", "P3", "P4"}
 ACCEPTANCE_BLOCKING_SEVERITIES = {"P0", "P1", "P2"}
-ACCEPTANCE_FULL_FIX_ROUNDS = 3
-ACCEPTANCE_MAX_ROUNDS = 6
+ACCEPTANCE_MODES = {"quick", "adaptive", "full"}
+ACCEPTANCE_DEFAULT_MODE = "adaptive"
+ACCEPTANCE_MAX_AUTO_FIX_ROUNDS = 2
+ACCEPTANCE_GLOBAL_UNIT = "GLOBAL"
 GIT_UNAVAILABLE = "__GIT_UNAVAILABLE__"
 
 
@@ -593,6 +594,29 @@ def task_plan_digest(tasks: list[Task]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
+def acceptance_tasks_file_hash(specs_dir: str | Path) -> str:
+    """Hash tasks.md content while ignoring mutable top-level progress metadata."""
+    path = specs_path(specs_dir) / "tasks.md"
+    mutable_labels = {
+        "状态", "status", "当前任务", "current task",
+        "进度", "progress", "最后更新", "last updated",
+    }
+    stable_lines: list[str] = []
+    before_first_task = True
+    for line in read_text(path).splitlines():
+        if TASK_RE.match(line):
+            before_first_task = False
+        match = TASK_TOP_FIELD_RE.match(line)
+        if before_first_task and match and match.group("label").strip().lower() in mutable_labels:
+            line = (
+                f"{match.group('indent')}{match.group('prefix')}{match.group('label')}"
+                f"{match.group('colon')}{match.group('suffix')}<mutable>"
+            )
+        stable_lines.append(line)
+    payload = "\n".join(stable_lines).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
 def task_phase_for_line(lines: list[str], start: int) -> str:
     phase = "Unphased"
     for line in lines[: start + 1]:
@@ -637,10 +661,12 @@ def review_unit_payload(index: int, tasks: list[Task], phase: str) -> dict[str, 
         "unit_id": f"U-{index:03d}",
         "task_ids": [task.task_id for task in tasks],
         "phase": phase,
+        "high_risk": any(task.is_high_risk for task in tasks),
+        "requires_adversarial": any(task.is_high_risk for task in tasks),
         "status": "pending",
         "review_status": "pending",
         "adversarial_status": "pending",
-        "round_started": None,
+        "round_started": 1,
         "last_result": None,
     }
 
@@ -660,21 +686,47 @@ def acceptance_fixes_path(specs_dir: str | Path) -> Path:
     return specs_path(specs_dir) / ACCEPTANCE_FIXES_FILE
 
 
-def default_acceptance_state(specs_dir: str | Path) -> dict[str, object]:
+def normalize_acceptance_mode(mode: str | None) -> str:
+    normalized = (mode or ACCEPTANCE_DEFAULT_MODE).strip().lower()
+    if normalized not in ACCEPTANCE_MODES:
+        raise SpecProgressError(
+            f"acceptance mode must be one of {', '.join(sorted(ACCEPTANCE_MODES))}"
+        )
+    return normalized
+
+
+def default_acceptance_state(
+    specs_dir: str | Path,
+    acceptance_mode: str = ACCEPTANCE_DEFAULT_MODE,
+) -> dict[str, object]:
     root = specs_path(specs_dir)
     tasks = parse_tasks(root)
+    mode = normalize_acceptance_mode(acceptance_mode)
+    if mode == "quick" and any(task.risk not in {"low", "低", "低风险"} for task in tasks):
+        raise SpecProgressError(
+            "Quick acceptance is limited to low-risk workflows; use adaptive or full"
+        )
+    units = build_review_units(root)
+    if mode == "full":
+        for unit in units:
+            unit["requires_adversarial"] = True
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "workflow": detect_workflow(root),
         "status": "initialized",
+        "acceptance_mode": mode,
         "round": 1,
-        "max_rounds": ACCEPTANCE_MAX_ROUNDS,
-        "full_fix_rounds": ACCEPTANCE_FULL_FIX_ROUNDS,
-        "policy": "rounds 1-3 fix all actionable issues; round 4+ auto-fix P0-P2 only",
+        "max_auto_fix_rounds": ACCEPTANCE_MAX_AUTO_FIX_ROUNDS,
+        "auto_fix_rounds": 0,
+        "policy": (
+            "P0-P2 trigger fixes and affected-unit re-review; P3-P4 are deferred; "
+            "at most two automatic fix rounds; one final global integration review"
+        ),
         "original_task_ids": [task.task_id for task in tasks],
         "original_task_digest": task_digest(tasks),
+        "original_tasks_file_hash": acceptance_tasks_file_hash(root),
         "task_count": len(tasks),
-        "review_units": build_review_units(root),
+        "review_units": units,
         "agents": [],
         "issues": [],
         "fixes": [],
@@ -692,8 +744,53 @@ def load_acceptance_state(specs_dir: str | Path) -> dict[str, object]:
     if not path.is_file():
         raise SpecProgressError(f"{ACCEPTANCE_STATE_FILE} is missing; run acceptance-init first")
     data = read_json(path)
-    if data.get("schema_version") != 1:
+    schema_version = data.get("schema_version")
+    if schema_version not in {1, 2}:
         raise SpecProgressError(f"Unsupported {ACCEPTANCE_STATE_FILE} schema_version: {data.get('schema_version')}")
+    if schema_version == 1:
+        # Keep unfinished 0.2.x runs strict: every unit still requires both
+        # historical reviewers, while the new integration gate is added before
+        # they may finish. Already accepted ledgers remain accepted.
+        data["schema_version"] = 2
+        data["legacy_schema_version"] = 1
+        data.setdefault("acceptance_mode", "full")
+        data.setdefault("max_auto_fix_rounds", ACCEPTANCE_MAX_AUTO_FIX_ROUNDS)
+        historical_fix_rounds = {
+            int(fix.get("round", 1)) for fix in data.get("fixes", [])
+        }
+        data.setdefault(
+            "auto_fix_rounds",
+            min(len(historical_fix_rounds), ACCEPTANCE_MAX_AUTO_FIX_ROUNDS),
+        )
+        data["policy"] = (
+            "legacy full review; P0-P2 trigger fixes and affected-unit re-review; "
+            "P3-P4 are deferred; one final global integration review"
+        )
+        for unit in data.get("review_units", []):
+            unit.setdefault("high_risk", False)
+            unit.setdefault("requires_adversarial", True)
+            unit.setdefault("round_started", 1)
+        bound_agents = {
+            str(issue.get("agent_id")) for issue in data.get("issues", [])
+            if issue.get("agent_id") not in {None, "", "n/a"}
+        }
+        for agent in data.get("agents", []):
+            if (
+                agent.get("result") == "ACTIONABLE_ISSUES"
+                and str(agent.get("agent_id")) not in bound_agents
+            ):
+                agent["legacy_unbound_allowed"] = True
+    mode = normalize_acceptance_mode(str(data.get("acceptance_mode", "full")))
+    data["acceptance_mode"] = mode
+    for unit in data.get("review_units", []):
+        unit.setdefault("high_risk", False)
+        unit.setdefault(
+            "requires_adversarial",
+            mode == "full" or bool(unit.get("high_risk")),
+        )
+        unit.setdefault("round_started", 1)
+    data.setdefault("max_auto_fix_rounds", ACCEPTANCE_MAX_AUTO_FIX_ROUNDS)
+    data.setdefault("auto_fix_rounds", 0)
     return data
 
 
@@ -712,9 +809,9 @@ def acceptance_summary(state: dict[str, object]) -> dict[str, object]:
         agent for agent in agents
         if int(agent.get("round", 0)) == current_round
     ]
-    pending_units = [
-        unit["unit_id"] for unit in units
-        if unit.get("status") != "pass"
+    mode = str(state.get("acceptance_mode", "full"))
+    pending_units = [] if mode == "quick" else [
+        unit["unit_id"] for unit in units if unit.get("status") != "pass"
     ]
     pending_agents = [
         agent["agent_id"] for agent in round_agents
@@ -722,8 +819,13 @@ def acceptance_summary(state: dict[str, object]) -> dict[str, object]:
     ]
     return {
         "status": state.get("status"),
+        "acceptance_mode": mode,
         "round": current_round,
         "policy": state.get("policy"),
+        "automatic_fix_rounds": {
+            "used": int(state.get("auto_fix_rounds", 0)),
+            "maximum": int(state.get("max_auto_fix_rounds", ACCEPTANCE_MAX_AUTO_FIX_ROUNDS)),
+        },
         "task_count": state.get("task_count"),
         "units": len(units),
         "pending_units": pending_units,
@@ -754,6 +856,7 @@ def acceptance_summary(state: dict[str, object]) -> dict[str, object]:
             ],
         },
         "affected_units": state.get("affected_units", []),
+        "integration_review": integration_review_status(state),
     }
 
 
@@ -771,44 +874,64 @@ def validate_original_tasks_unchanged(specs_dir: str | Path, state: dict[str, ob
         raise SpecProgressError(
             "Original tasks.md task text changed during acceptance; update specs and reapprove before final acceptance"
         )
+    original_file_hash = state.get("original_tasks_file_hash")
+    if original_file_hash and acceptance_tasks_file_hash(specs_dir) != original_file_hash:
+        raise SpecProgressError(
+            "Original tasks.md file changed during acceptance; use acceptance-fixes.md for repair work"
+        )
 
 
 def agent_id_for(round_number: int, role: str, unit_id: str) -> str:
-    short_role = "R" if role == "first_wave" else "A"
+    short_role = {"first_wave": "R", "adversarial": "A", "integration": "I"}[role]
     return f"round-{round_number}-{short_role}-{unit_id}"
 
 
-def planned_agents_for_units(round_number: int, units: list[dict[str, object]]) -> list[dict[str, object]]:
+def agent_payload(
+    round_number: int,
+    role: str,
+    unit_id: str,
+    task_ids: list[str],
+) -> dict[str, object]:
+    return {
+        "agent_id": agent_id_for(round_number, role, unit_id),
+        "round": round_number,
+        "role": role,
+        "unit_id": unit_id,
+        "task_ids": task_ids,
+        "status": "planned",
+        "result": None,
+        "started_at": None,
+        "completed_at": None,
+        "report": "",
+    }
+
+
+def planned_agents_for_units(
+    round_number: int,
+    units: list[dict[str, object]],
+    acceptance_mode: str,
+) -> list[dict[str, object]]:
     agents: list[dict[str, object]] = []
+    if acceptance_mode == "quick":
+        return agents
     for unit in units:
-        for role in ("first_wave", "adversarial"):
-            agents.append(
-                {
-                    "agent_id": agent_id_for(round_number, role, str(unit["unit_id"])),
-                    "round": round_number,
-                    "role": role,
-                    "unit_id": unit["unit_id"],
-                    "task_ids": unit["task_ids"],
-                    "status": "planned",
-                    "result": None,
-                    "started_at": None,
-                    "completed_at": None,
-                    "report": "",
-                }
-            )
+        roles = ["first_wave"]
+        if acceptance_mode == "full" or unit.get("requires_adversarial"):
+            roles.append("adversarial")
+        for role in roles:
+            agents.append(agent_payload(
+                round_number,
+                role,
+                str(unit["unit_id"]),
+                list(unit["task_ids"]),
+            ))
     return agents
 
 
-def severity_blocks_round(severity: str, round_number: int) -> bool:
-    if round_number <= ACCEPTANCE_FULL_FIX_ROUNDS:
-        return severity in ACCEPTANCE_SEVERITIES
-    return severity in ACCEPTANCE_BLOCKING_SEVERITIES
-
-
-def issue_should_fix(issue: dict[str, object], round_number: int) -> bool:
+def issue_should_fix(issue: dict[str, object]) -> bool:
     if issue.get("status") in {"fixed", "deferred"}:
         return False
-    return severity_blocks_round(str(issue.get("severity", "")).upper(), round_number)
+    return str(issue.get("severity", "")).upper() in ACCEPTANCE_BLOCKING_SEVERITIES
 
 
 def find_unit(state: dict[str, object], unit_id: str) -> dict[str, object]:
@@ -837,6 +960,232 @@ def find_fix(state: dict[str, object], fix_id: str) -> dict[str, object]:
         if fix.get("fix_id") == fix_id:
             return fix
     raise SpecProgressError(f"Acceptance fix not found: {fix_id}")
+
+
+def required_roles(state: dict[str, object], unit: dict[str, object]) -> list[str]:
+    mode = str(state.get("acceptance_mode", "full"))
+    if mode == "quick":
+        return []
+    roles = ["first_wave"]
+    if mode == "full" or unit.get("requires_adversarial") or unit.get("high_risk"):
+        roles.append("adversarial")
+    return roles
+
+
+def refresh_unit_status(state: dict[str, object], unit: dict[str, object]) -> None:
+    status_fields = {
+        "first_wave": "review_status",
+        "adversarial": "adversarial_status",
+    }
+    statuses = [unit.get(status_fields[role], "pending") for role in required_roles(state, unit)]
+    if statuses and all(status == "pass" for status in statuses):
+        unit["status"] = "pass"
+        unit["last_result"] = "PASS"
+    elif "issues" in statuses:
+        unit["status"] = "issues"
+        unit["last_result"] = "ACTIONABLE_ISSUES"
+    else:
+        unit["status"] = "pending"
+        unit["last_result"] = None
+
+
+def ensure_adversarial_agent(state: dict[str, object], unit: dict[str, object]) -> bool:
+    if state.get("acceptance_mode") == "quick":
+        return False
+    unit["requires_adversarial"] = True
+    round_number = int(state.get("round", 1))
+    exists = any(
+        agent.get("role") == "adversarial"
+        and agent.get("unit_id") == unit.get("unit_id")
+        and int(agent.get("round", 0)) == round_number
+        for agent in state.get("agents", [])
+    )
+    if exists:
+        return False
+    state.setdefault("agents", []).append(agent_payload(
+        round_number,
+        "adversarial",
+        str(unit["unit_id"]),
+        list(unit.get("task_ids", [])),
+    ))
+    return True
+
+
+def current_round_agents(state: dict[str, object]) -> list[dict[str, object]]:
+    round_number = int(state.get("round", 1))
+    return [
+        agent for agent in state.get("agents", [])
+        if int(agent.get("round", 0)) == round_number
+    ]
+
+
+def current_integration_agent(state: dict[str, object]) -> dict[str, object] | None:
+    return next(
+        (
+            agent for agent in reversed(list(state.get("agents", [])))
+            if agent.get("role") == "integration"
+            and int(agent.get("round", 0)) == int(state.get("round", 1))
+        ),
+        None,
+    )
+
+
+def integration_review_status(state: dict[str, object]) -> dict[str, object]:
+    agent = current_integration_agent(state)
+    if agent is None and state.get("status") == "accepted" and state.get("legacy_schema_version") == 1:
+        return {"status": "pass", "agent_id": "legacy-accepted", "result": "PASS"}
+    if agent is None:
+        return {"status": "not-planned", "agent_id": None, "result": None}
+    return {
+        "status": agent.get("status"),
+        "agent_id": agent.get("agent_id"),
+        "result": agent.get("result"),
+    }
+
+
+def unbound_actionable_agents(state: dict[str, object]) -> list[dict[str, object]]:
+    bound = {
+        str(issue.get("agent_id"))
+        for issue in state.get("issues", [])
+        if issue.get("agent_id") not in {None, "", "n/a"}
+    }
+    return [
+        agent for agent in state.get("agents", [])
+        if agent.get("result") == "ACTIONABLE_ISSUES"
+        and str(agent.get("agent_id")) not in bound
+        and not agent.get("legacy_unbound_allowed")
+    ]
+
+
+def unresolved_acceptance_issues(state: dict[str, object]) -> list[dict[str, object]]:
+    return [
+        issue for issue in state.get("issues", [])
+        if issue.get("status") not in {"fixed", "deferred"}
+    ]
+
+
+def pending_acceptance_fixes(state: dict[str, object]) -> list[dict[str, object]]:
+    return [
+        fix for fix in state.get("fixes", [])
+        if fix.get("status") in {"pending", "active"}
+    ]
+
+
+def plan_integration_if_ready(state: dict[str, object]) -> bool:
+    if state.get("status") in {"accepted", "blocked"} or current_integration_agent(state):
+        return False
+    if unbound_actionable_agents(state) or unresolved_acceptance_issues(state):
+        return False
+    if pending_acceptance_fixes(state) or state.get("affected_units"):
+        return False
+    if state.get("acceptance_mode") != "quick" and any(
+        unit.get("status") != "pass" for unit in state.get("review_units", [])
+    ):
+        return False
+    state.setdefault("agents", []).append(agent_payload(
+        int(state.get("round", 1)),
+        "integration",
+        ACCEPTANCE_GLOBAL_UNIT,
+        list(state.get("original_task_ids", [])),
+    ))
+    state["status"] = "integration-planned"
+    return True
+
+
+def unit_ids_for_tasks(state: dict[str, object], task_ids: list[str]) -> list[str]:
+    selected = set(task_ids)
+    return sorted(
+        str(unit["unit_id"])
+        for unit in state.get("review_units", [])
+        if selected.intersection(unit.get("task_ids", []))
+    )
+
+
+def unit_review_failures(state: dict[str, object]) -> list[str]:
+    failures: list[str] = []
+    for unit in state.get("review_units", []):
+        round_started = int(unit.get("round_started") or 1)
+        for role in required_roles(state, unit):
+            agent = next(
+                (
+                    item for item in reversed(list(state.get("agents", [])))
+                    if item.get("unit_id") == unit.get("unit_id")
+                    and item.get("role") == role
+                    and int(item.get("round", 0)) == round_started
+                ),
+                None,
+            )
+            if not agent or agent.get("status") != "completed" or agent.get("result") != "PASS":
+                failures.append(f"{unit.get('unit_id')}:{role}")
+    return failures
+
+
+def review_worktree_digest(specs_dir: str | Path) -> str:
+    root = repo_root_for(specs_dir)
+    ignored = progress_file_paths(specs_dir)
+    entries: list[tuple[str, str]] = []
+    for relative in sorted(dirty_paths(specs_dir)):
+        normalized = relative.replace("\\", "/")
+        if normalized in ignored:
+            continue
+        target = root / Path(normalized)
+        if target.is_file():
+            entries.append((normalized, hashlib.sha256(target.read_bytes()).hexdigest()))
+        elif target.is_dir():
+            for child in sorted(path for path in target.rglob("*") if path.is_file()):
+                child_name = child.relative_to(root).as_posix()
+                if child_name in ignored:
+                    continue
+                entries.append((child_name, hashlib.sha256(child.read_bytes()).hexdigest()))
+        else:
+            entries.append((normalized, "missing"))
+    payload = json.dumps(entries, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def acceptance_review_snapshot(specs_dir: str | Path, state: dict[str, object]) -> dict[str, object]:
+    root = specs_path(specs_dir)
+    workflow = str(state.get("workflow") or detect_workflow(root))
+    names = primary_artifacts(workflow) + ["tasks.md", "spec.yml"]
+    snapshot: dict[str, object] = {
+        "files": {name: sha256_text_file(root / name) for name in names},
+    }
+    if git_available(root):
+        snapshot["git_commit"] = current_commit(root)
+        snapshot["git_worktree_digest"] = review_worktree_digest(root)
+    return snapshot
+
+
+def acceptance_immutable_snapshot(specs_dir: str | Path, state: dict[str, object]) -> dict[str, object]:
+    """Review snapshot excluding task/index metadata changed only by finalization."""
+    snapshot = acceptance_review_snapshot(specs_dir, state)
+    files = dict(snapshot.get("files", {}))
+    files.pop("tasks.md", None)
+    files.pop("spec.yml", None)
+    snapshot["files"] = files
+    return snapshot
+
+
+def reset_integration_after_drift(
+    specs_dir: str | Path,
+    state: dict[str, object],
+    agent: dict[str, object],
+) -> None:
+    agent.update({
+        "status": "planned",
+        "result": None,
+        "started_at": None,
+        "completed_at": None,
+        "report": "",
+    })
+    agent.pop("review_snapshot", None)
+    state.pop("finalization_snapshot", None)
+    state.pop("accepted_snapshot", None)
+    state["status"] = "integration-planned"
+    note = "Reviewed inputs changed; a fresh global integration review is required"
+    if note not in state.setdefault("notes", []):
+        state["notes"].append(note)
+    save_acceptance_state(specs_dir, state)
 
 
 def create_acceptance_fixes_file(specs_dir: str | Path, state: dict[str, object]) -> None:
@@ -968,6 +1317,28 @@ def business_paths(paths: list[str]) -> list[str]:
     result = []
     for path in paths:
         if any(path.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        result.append(path)
+    return result
+
+
+def exclude_workflow_paths(paths: list[str], specs_dir: str | Path) -> list[str]:
+    """Remove the current spec directory, including collapsed untracked parents."""
+    root = repo_root_for(specs_dir)
+    try:
+        relative = specs_path(specs_dir).relative_to(root).as_posix().rstrip("/")
+    except ValueError:
+        return paths
+    if relative in {"", "."}:
+        ignored = progress_file_paths(specs_dir)
+        return [path for path in paths if path.replace("\\", "/") not in ignored]
+    prefix = relative + "/"
+    result: list[str] = []
+    for path in paths:
+        normalized = path.replace("\\", "/").rstrip("/")
+        if normalized == relative or normalized.startswith(prefix):
+            continue
+        if relative.startswith(normalized + "/"):
             continue
         result.append(path)
     return result
@@ -1157,6 +1528,26 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:12]
 
 
+def sha256_text_file(path: Path) -> str:
+    if not path.is_file():
+        return "missing"
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+def sha256_text_variants(path: Path) -> set[str]:
+    """Hashes for raw, LF, and CRLF forms of the same UTF-8 text."""
+    if not path.is_file():
+        return {"missing"}
+    raw = path.read_bytes()
+    normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    crlf = normalized.replace(b"\n", b"\r\n")
+    return {
+        hashlib.sha256(content).hexdigest()[:12]
+        for content in (raw, normalized, crlf)
+    }
+
+
 def extract_requirement_ids(specs_dir: str | Path, workflow: str) -> list[str]:
     root = specs_path(specs_dir)
     ids: set[str] = set()
@@ -1183,7 +1574,7 @@ def write_spec_index(
     workflow: str,
     current_task: str,
     approval: str,
-    mode: str = "strict",
+    mode: str | None = None,
     risk_level: str | None = None,
     preserve_hashes: bool = False,
     preserve_task_plan_hash: bool = False,
@@ -1191,6 +1582,8 @@ def write_spec_index(
     root = specs_path(specs_dir)
     tasks = parse_tasks(root)
     existing = parse_flat_yml(root / "spec.yml")
+    if mode is None:
+        mode = existing.get("mode", "strict")
     if risk_level is None:
         risk_level = "high" if any(task.is_high_risk for task in tasks) else "low"
     artifact_names = primary_artifacts(workflow) + ["tasks.md", "progress.md", "spec.yml"]
@@ -1198,7 +1591,7 @@ def write_spec_index(
         hashes = existing["artifact_hashes"]
     else:
         hashes = ", ".join(
-            f"{name}={sha256_file(root / name)}" for name in primary_artifacts(workflow)
+            f"{name}={sha256_text_file(root / name)}" for name in primary_artifacts(workflow)
         )
     if preserve_task_plan_hash:
         task_plan_hash = existing.get("task_plan_hash", "n/a")
@@ -1284,7 +1677,10 @@ def command_approve(specs_dir: str | Path, evidence: str) -> str:
     return f"Approved {workflow} specs; frozen baseline recorded"
 
 
-def command_acceptance_init(specs_dir: str | Path) -> dict[str, object]:
+def command_acceptance_init(
+    specs_dir: str | Path,
+    acceptance_mode: str | None = None,
+) -> dict[str, object]:
     pre = command_pre_acceptance(specs_dir)
     if not pre["ok"]:
         raise SpecProgressError("Pre-acceptance must pass before final acceptance: " + "; ".join(pre["issues"]))
@@ -1292,10 +1688,25 @@ def command_acceptance_init(specs_dir: str | Path) -> dict[str, object]:
     if path.is_file():
         state = load_acceptance_state(specs_dir)
         validate_original_tasks_unchanged(specs_dir, state)
+        if acceptance_mode is not None:
+            requested = normalize_acceptance_mode(acceptance_mode)
+            if requested != state.get("acceptance_mode"):
+                raise SpecProgressError(
+                    "Acceptance mode is frozen after initialization: "
+                    f"{state.get('acceptance_mode')} (requested {requested})"
+                )
         return acceptance_summary(state)
-    state = default_acceptance_state(specs_dir)
+    state = default_acceptance_state(
+        specs_dir,
+        normalize_acceptance_mode(acceptance_mode),
+    )
+    state["agents"] = planned_agents_for_units(
+        int(state["round"]),
+        list(state["review_units"]),
+        str(state["acceptance_mode"]),
+    )
     state["status"] = "agents-planned"
-    state["agents"] = planned_agents_for_units(int(state["round"]), list(state["review_units"]))
+    plan_integration_if_ready(state)
     save_acceptance_state(specs_dir, state)
     return acceptance_summary(state)
 
@@ -1308,13 +1719,49 @@ def command_acceptance_status(specs_dir: str | Path) -> dict[str, object]:
 
 def command_acceptance_start_agent(specs_dir: str | Path, agent_id: str) -> dict[str, object]:
     state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        raise SpecProgressError("Acceptance is already accepted and cannot be modified")
     validate_original_tasks_unchanged(specs_dir, state)
     agent = find_agent(state, agent_id)
-    if agent.get("status") == "completed":
-        raise SpecProgressError(f"Acceptance agent is already completed: {agent_id}")
+    if int(agent.get("round", 0)) != int(state.get("round", 1)):
+        raise SpecProgressError(f"Acceptance agent belongs to an earlier round: {agent_id}")
+    if agent.get("status") != "planned":
+        raise SpecProgressError(
+            f"Acceptance agent must be planned before start: {agent_id} ({agent.get('status')})"
+        )
+    if agent.get("role") == "adversarial":
+        primary = next(
+            (
+                item for item in state.get("agents", [])
+                if item.get("unit_id") == agent.get("unit_id")
+                and item.get("role") == "first_wave"
+                and int(item.get("round", 0)) == int(agent.get("round", 0))
+            ),
+            None,
+        )
+        if not primary or primary.get("status") != "completed":
+            raise SpecProgressError(
+                f"Adversarial review must wait for first-wave completion: {agent_id}"
+            )
+    if agent.get("role") == "integration":
+        pre = command_pre_acceptance(specs_dir)
+        if not pre["ok"]:
+            raise SpecProgressError(
+                "Global integration review requires a clean pre-acceptance state: "
+                + "; ".join(pre["issues"])
+            )
+        if (
+            unbound_actionable_agents(state)
+            or unresolved_acceptance_issues(state)
+            or pending_acceptance_fixes(state)
+            or state.get("affected_units")
+            or unit_review_failures(state)
+        ):
+            raise SpecProgressError("Global integration review is not ready to start")
+        agent["review_snapshot"] = acceptance_review_snapshot(specs_dir, state)
     agent["status"] = "running"
     agent["started_at"] = now()
-    state["status"] = "agents-running"
+    state["status"] = "integration-running" if agent.get("role") == "integration" else "agents-running"
     save_acceptance_state(specs_dir, state)
     return acceptance_summary(state)
 
@@ -1330,32 +1777,67 @@ def command_acceptance_complete_agent(
         raise SpecProgressError(
             f"result must be one of {', '.join(sorted(ACCEPTANCE_AGENT_RESULTS))}"
         )
+    if not report.strip():
+        raise SpecProgressError("Completing an acceptance agent requires a review report")
     state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        raise SpecProgressError("Acceptance is already accepted and cannot be modified")
     validate_original_tasks_unchanged(specs_dir, state)
     agent = find_agent(state, agent_id)
+    if int(agent.get("round", 0)) != int(state.get("round", 1)):
+        raise SpecProgressError(f"Acceptance agent belongs to an earlier round: {agent_id}")
+    if agent.get("status") != "running":
+        raise SpecProgressError(
+            f"Acceptance agent must be running before completion: {agent_id} ({agent.get('status')})"
+        )
+    if normalized == "ACTIONABLE_ISSUES":
+        blocking = [
+            issue for issue in state.get("issues", [])
+            if issue.get("agent_id") == agent_id
+            and str(issue.get("severity", "")).upper() in ACCEPTANCE_BLOCKING_SEVERITIES
+        ]
+        if not blocking:
+            raise SpecProgressError(
+                "ACTIONABLE_ISSUES requires at least one recorded P0-P2 issue for this agent; "
+                "record P3-P4 advisories and complete the agent with PASS"
+            )
+    if agent.get("role") == "integration" and normalized == "PASS":
+        pre = command_pre_acceptance(specs_dir)
+        if not pre["ok"]:
+            raise SpecProgressError(
+                "Global integration PASS requires a clean pre-acceptance state: "
+                + "; ".join(pre["issues"])
+            )
+        if agent.get("review_snapshot") != acceptance_review_snapshot(specs_dir, state):
+            reset_integration_after_drift(specs_dir, state, agent)
+            raise SpecProgressError(
+                "Reviewed inputs changed while the global integration review was running; "
+                "start a fresh global integration review"
+            )
     agent["status"] = "completed"
     agent["result"] = normalized
     agent["completed_at"] = now()
-    agent["report"] = report or "n/a"
-    unit = find_unit(state, str(agent["unit_id"]))
-    if agent["role"] == "first_wave":
-        unit["review_status"] = "pass" if normalized == "PASS" else "issues"
+    agent["report"] = report.strip()
+    if agent["role"] == "integration":
+        if normalized == "PASS":
+            state["status"] = "ready-to-finish"
+        else:
+            state["status"] = "review-complete"
     else:
-        unit["adversarial_status"] = "pass" if normalized == "PASS" else "issues"
-    if unit.get("review_status") == "pass" and unit.get("adversarial_status") == "pass":
-        unit["status"] = "pass"
-        unit["last_result"] = "PASS"
-    elif "issues" in {unit.get("review_status"), unit.get("adversarial_status")}:
-        unit["status"] = "issues"
-        unit["last_result"] = "ACTIONABLE_ISSUES"
+        unit = find_unit(state, str(agent["unit_id"]))
+        if agent["role"] == "first_wave":
+            unit["review_status"] = "pass" if normalized == "PASS" else "issues"
+            if normalized == "ACTIONABLE_ISSUES" and state.get("acceptance_mode") == "adaptive":
+                ensure_adversarial_agent(state, unit)
+        else:
+            unit["adversarial_status"] = "pass" if normalized == "PASS" else "issues"
+        refresh_unit_status(state, unit)
 
-    round_number = int(state.get("round", 1))
-    current_agents = [
-        item for item in state.get("agents", [])
-        if int(item.get("round", 0)) == round_number
-    ]
-    if current_agents and all(item.get("status") == "completed" for item in current_agents):
-        state["status"] = "review-complete"
+    current_agents = current_round_agents(state)
+    if agent["role"] != "integration":
+        if all(item.get("status") == "completed" for item in current_agents):
+            state["status"] = "review-complete"
+        plan_integration_if_ready(state)
     save_acceptance_state(specs_dir, state)
     return acceptance_summary(state)
 
@@ -1375,19 +1857,50 @@ def command_acceptance_record_issue(
     if not title.strip() or not evidence.strip():
         raise SpecProgressError("Acceptance issue requires title and evidence")
     state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        raise SpecProgressError("Acceptance is already accepted and cannot be modified")
     validate_original_tasks_unchanged(specs_dir, state)
-    unit = find_unit(state, unit_id)
+    unit = None if unit_id == ACCEPTANCE_GLOBAL_UNIT else find_unit(state, unit_id)
+    integration = current_integration_agent(state)
+    if integration and integration.get("status") == "planned":
+        state["agents"].remove(integration)
+        state["status"] = "review-complete"
+    elif unit is not None and integration:
+        raise SpecProgressError(
+            "Record unit review issues before starting the global integration review"
+        )
+    if unit_id == ACCEPTANCE_GLOBAL_UNIT:
+        allowed_tasks = set(state.get("original_task_ids", []))
+    else:
+        allowed_tasks = set(unit.get("task_ids", []))
     issue_number = len(state.get("issues", [])) + 1
     issue_id = f"I-{issue_number:03d}"
     if task_ids.strip():
         selected_tasks = [item.strip() for item in re.split(r"[,，、\s]+", task_ids) if item.strip()]
     else:
-        selected_tasks = list(unit.get("task_ids", []))
-    unknown = sorted(set(selected_tasks) - set(unit.get("task_ids", [])), key=task_sort_key)
+        selected_tasks = list(state.get("original_task_ids", [])) if unit is None else list(unit.get("task_ids", []))
+    unknown = sorted(set(selected_tasks) - allowed_tasks, key=task_sort_key)
     if unknown:
         raise SpecProgressError(
             f"Issue task IDs must belong to {unit_id}; unexpected: {', '.join(unknown)}"
         )
+    if agent_id:
+        source_agent = find_agent(state, agent_id)
+        if source_agent.get("status") not in {"running", "completed"}:
+            raise SpecProgressError(f"Issue agent has not started: {agent_id}")
+        if source_agent.get("unit_id") != unit_id:
+            raise SpecProgressError(
+                f"Issue unit {unit_id} does not match agent {agent_id} unit {source_agent.get('unit_id')}"
+            )
+        if int(source_agent.get("round", 0)) != int(state.get("round", 1)):
+            raise SpecProgressError(f"Issue agent belongs to an earlier acceptance round: {agent_id}")
+    affected_unit_ids = (
+        unit_ids_for_tasks(state, selected_tasks)
+        if unit is None
+        else [unit_id]
+    )
+    if unit is None and not affected_unit_ids:
+        affected_unit_ids = [str(item["unit_id"]) for item in state.get("review_units", [])]
     issue = {
         "issue_id": issue_id,
         "round": int(state.get("round", 1)),
@@ -1397,41 +1910,93 @@ def command_acceptance_record_issue(
         "title": title.strip(),
         "evidence": evidence.strip(),
         "agent_id": agent_id or "n/a",
+        "affected_unit_ids": affected_unit_ids,
         "status": "open",
         "created_at": now(),
         "fix_id": None,
     }
     state.setdefault("issues", []).append(issue)
-    unit["status"] = "issues"
-    unit["last_result"] = "ACTIONABLE_ISSUES"
-    affected = set(state.get("affected_units", []))
-    affected.add(unit_id)
-    state["affected_units"] = sorted(affected)
+    if normalized in ACCEPTANCE_BLOCKING_SEVERITIES:
+        if unit is not None:
+            unit["status"] = "issues"
+            unit["last_result"] = "ACTIONABLE_ISSUES"
+            if state.get("acceptance_mode") == "adaptive":
+                ensure_adversarial_agent(state, unit)
+        affected = set(state.get("affected_units", []))
+        affected.update(affected_unit_ids)
+        state["affected_units"] = sorted(affected)
+        state["status"] = "review-complete"
     save_acceptance_state(specs_dir, state)
     return acceptance_summary(state)
 
 
 def command_acceptance_plan_fixes(specs_dir: str | Path) -> dict[str, object]:
     state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        raise SpecProgressError("Acceptance is already accepted and cannot be modified")
     validate_original_tasks_unchanged(specs_dir, state)
     round_number = int(state.get("round", 1))
+    pending_agents = [
+        agent for agent in current_round_agents(state)
+        if agent.get("status") in {"planned", "running"}
+        and (agent.get("role") != "integration" or agent.get("status") == "running")
+    ]
+    if pending_agents:
+        raise SpecProgressError(
+            "Complete the current review agents before planning fixes: "
+            + ", ".join(str(agent["agent_id"]) for agent in pending_agents)
+        )
+    unbound = unbound_actionable_agents(state)
+    if unbound:
+        raise SpecProgressError(
+            "ACTIONABLE_ISSUES results must be bound to recorded issue IDs: "
+            + ", ".join(str(agent["agent_id"]) for agent in unbound)
+        )
     existing_issue_ids = {
         issue_id
         for fix in state.get("fixes", [])
         for issue_id in fix.get("issue_ids", [])
     }
     deferred_ids = {issue.get("issue_id") for issue in state.get("deferred_issues", [])}
+    to_fix: list[dict[str, object]] = []
     for issue in state.get("issues", []):
         issue_id = str(issue["issue_id"])
         if issue_id in existing_issue_ids or issue_id in deferred_ids:
             continue
-        if issue_should_fix(issue, round_number):
+        if issue_should_fix(issue):
+            to_fix.append(issue)
+        else:
+            deferred = dict(issue)
+            deferred["reason"] = "P3-P4 are advisory and are not auto-fixed"
+            issue["status"] = "deferred"
+            state.setdefault("deferred_issues", []).append(deferred)
+
+    if to_fix and int(state.get("auto_fix_rounds", 0)) >= int(
+        state.get("max_auto_fix_rounds", ACCEPTANCE_MAX_AUTO_FIX_ROUNDS)
+    ):
+        state["status"] = "blocked"
+        state["decision_required"] = {
+            "reason": "automatic-fix-limit",
+            "issue_ids": [str(issue["issue_id"]) for issue in to_fix],
+            "allowed_actions": [
+                "repair outside automatic acceptance, update/reapprove specs if needed, then start a new acceptance ledger",
+                "stop the workflow without accepting it",
+            ],
+        }
+        note = (
+            "Automatic acceptance fix limit reached with unresolved P0-P2 issues; "
+            "human decision is required"
+        )
+        if note not in state.setdefault("notes", []):
+            state["notes"].append(note)
+    elif to_fix:
+        for issue in to_fix:
             fix_id = f"F-{len(state.get('fixes', [])) + 1:03d}"
             fix = {
                 "fix_id": fix_id,
                 "round": round_number,
-                "issue_ids": [issue_id],
-                "unit_ids": [issue["unit_id"]],
+                "issue_ids": [issue["issue_id"]],
+                "unit_ids": list(issue.get("affected_unit_ids") or [issue["unit_id"]]),
                 "task_ids": list(issue.get("task_ids", [])),
                 "severity": issue["severity"],
                 "title": issue["title"],
@@ -1443,23 +2008,12 @@ def command_acceptance_plan_fixes(specs_dir: str | Path) -> dict[str, object]:
             issue["status"] = "planned"
             issue["fix_id"] = fix_id
             state.setdefault("fixes", []).append(fix)
-        else:
-            deferred = dict(issue)
-            deferred["reason"] = f"round {round_number} only auto-fixes P0-P2"
-            issue["status"] = "deferred"
-            state.setdefault("deferred_issues", []).append(deferred)
-    if int(state.get("round", 1)) >= ACCEPTANCE_MAX_ROUNDS:
-        blocking = [
-            issue for issue in state.get("issues", [])
-            if issue.get("status") in {"open", "planned"} and str(issue.get("severity")) in ACCEPTANCE_BLOCKING_SEVERITIES
-        ]
-        if blocking:
-            state["status"] = "blocked"
-            state.setdefault("notes", []).append(
-                f"Reached max acceptance rounds ({ACCEPTANCE_MAX_ROUNDS}) with blocking P0-P2 issues"
-            )
-    elif any(fix.get("status") in {"pending", "active"} for fix in state.get("fixes", [])):
+        state["auto_fix_rounds"] = int(state.get("auto_fix_rounds", 0)) + 1
         state["status"] = "fixes-planned"
+    elif pending_acceptance_fixes(state):
+        state["status"] = "fixes-planned"
+    else:
+        plan_integration_if_ready(state)
     create_acceptance_fixes_file(specs_dir, state)
     save_acceptance_state(specs_dir, state)
     return acceptance_summary(state)
@@ -1467,6 +2021,8 @@ def command_acceptance_plan_fixes(specs_dir: str | Path) -> dict[str, object]:
 
 def command_acceptance_fix_start(specs_dir: str | Path, fix_id: str) -> dict[str, object]:
     state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        raise SpecProgressError("Acceptance is already accepted and cannot be modified")
     validate_original_tasks_unchanged(specs_dir, state)
     fix = find_fix(state, fix_id)
     if fix.get("status") == "done":
@@ -1487,6 +2043,8 @@ def command_acceptance_fix_complete(
     if not evidence.strip():
         raise SpecProgressError("Completing an acceptance fix requires evidence")
     state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        raise SpecProgressError("Acceptance is already accepted and cannot be modified")
     validate_original_tasks_unchanged(specs_dir, state)
     fix = find_fix(state, fix_id)
     fix["status"] = "done"
@@ -1507,73 +2065,67 @@ def command_acceptance_fix_complete(
 
 def command_acceptance_next_round(specs_dir: str | Path) -> dict[str, object]:
     state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        raise SpecProgressError("Acceptance is already accepted and cannot be modified")
     validate_original_tasks_unchanged(specs_dir, state)
-    round_number = int(state.get("round", 1))
-    if round_number >= ACCEPTANCE_MAX_ROUNDS:
-        state["status"] = "blocked"
-        state.setdefault("notes", []).append(
-            f"Cannot start round {round_number + 1}; max rounds is {ACCEPTANCE_MAX_ROUNDS}"
+    if state.get("status") == "blocked":
+        raise SpecProgressError(
+            "Acceptance is blocked after the automatic-fix limit. Stop without accepting, "
+            "or repair/reapprove as needed and archive this ledger before starting a new acceptance ledger."
         )
-        save_acceptance_state(specs_dir, state)
-        return acceptance_summary(state)
-    if any(fix.get("status") in {"pending", "active"} for fix in state.get("fixes", [])):
+    pending_agents = [
+        agent for agent in current_round_agents(state)
+        if agent.get("status") in {"planned", "running"}
+    ]
+    if pending_agents:
+        raise SpecProgressError("Current acceptance review agents are still pending")
+    if unbound_actionable_agents(state):
+        raise SpecProgressError("ACTIONABLE_ISSUES results are missing recorded issue IDs")
+    if pending_acceptance_fixes(state):
         raise SpecProgressError("Pending acceptance fixes remain; complete or defer them before next round")
+    unresolved = unresolved_acceptance_issues(state)
+    if unresolved:
+        raise SpecProgressError(
+            "Unresolved acceptance issues remain: "
+            + ", ".join(str(issue["issue_id"]) for issue in unresolved)
+        )
     affected = list(state.get("affected_units", []))
     if not affected:
-        affected = [
-            str(unit["unit_id"]) for unit in state.get("review_units", [])
-            if unit.get("status") != "pass"
-        ]
-    if not affected:
-        state["status"] = "ready-to-finish"
+        integration = current_integration_agent(state)
+        if integration and integration.get("result") == "PASS":
+            state["status"] = "ready-to-finish"
+        else:
+            plan_integration_if_ready(state)
         save_acceptance_state(specs_dir, state)
         return acceptance_summary(state)
+    round_number = int(state.get("round", 1))
     state["round"] = round_number + 1
-    for unit in state.get("review_units", []):
-        if unit.get("unit_id") in affected:
-            unit["status"] = "pending"
-            unit["review_status"] = "pending"
-            unit["adversarial_status"] = "pending"
-            unit["round_started"] = state["round"]
-    review_units = [
-        unit for unit in state.get("review_units", [])
-        if unit.get("unit_id") in affected
-    ]
-    state.setdefault("agents", []).extend(planned_agents_for_units(int(state["round"]), review_units))
     state["affected_units"] = []
-    state["status"] = "agents-planned"
+    if state.get("acceptance_mode") == "quick":
+        state["status"] = "integration-planned"
+        plan_integration_if_ready(state)
+    else:
+        for unit in state.get("review_units", []):
+            if unit.get("unit_id") in affected:
+                unit["status"] = "pending"
+                unit["review_status"] = "pending"
+                unit["adversarial_status"] = "pending"
+                unit["round_started"] = state["round"]
+        review_units = [
+            unit for unit in state.get("review_units", [])
+            if unit.get("unit_id") in affected
+        ]
+        state.setdefault("agents", []).extend(planned_agents_for_units(
+            int(state["round"]),
+            review_units,
+            str(state.get("acceptance_mode", "full")),
+        ))
+        state["status"] = "agents-planned"
     save_acceptance_state(specs_dir, state)
     return acceptance_summary(state)
 
 
-def command_acceptance_finish(specs_dir: str | Path) -> dict[str, object]:
-    state = load_acceptance_state(specs_dir)
-    validate_original_tasks_unchanged(specs_dir, state)
-    unresolved = [
-        issue for issue in state.get("issues", [])
-        if issue.get("status") not in {"fixed", "deferred"}
-    ]
-    pending_agents = [
-        agent for agent in state.get("agents", [])
-        if agent.get("status") in {"planned", "running"}
-    ]
-    pending_fixes = [
-        fix for fix in state.get("fixes", [])
-        if fix.get("status") in {"pending", "active"}
-    ]
-    if pending_agents or pending_fixes or unresolved:
-        details = []
-        if pending_agents:
-            details.append("pending agents: " + ", ".join(agent["agent_id"] for agent in pending_agents))
-        if pending_fixes:
-            details.append("pending fixes: " + ", ".join(fix["fix_id"] for fix in pending_fixes))
-        if unresolved:
-            details.append("unresolved issues: " + ", ".join(issue["issue_id"] for issue in unresolved))
-        raise SpecProgressError("Acceptance cannot finish; " + "; ".join(details))
-    state["status"] = "accepted"
-    state["completed_at"] = now()
-    save_acceptance_state(specs_dir, state)
-    workflow = detect_workflow(specs_dir)
+def write_acceptance_terminal_files(specs_dir: str | Path, workflow: str) -> None:
     write_progress(
         specs_dir,
         workflow,
@@ -1585,7 +2137,123 @@ def command_acceptance_finish(specs_dir: str | Path) -> dict[str, object]:
         note="Final acceptance accepted",
     )
     update_tasks_metadata(specs_dir, status="Accepted", current_task="n/a")
-    write_spec_index(specs_dir, workflow, "n/a", "approved")
+    write_spec_index(
+        specs_dir,
+        workflow,
+        "n/a",
+        "approved",
+        preserve_hashes=True,
+        preserve_task_plan_hash=True,
+    )
+
+
+def command_acceptance_finish(specs_dir: str | Path) -> dict[str, object]:
+    state = load_acceptance_state(specs_dir)
+    if state.get("status") == "accepted":
+        workflow = str(state.get("workflow") or detect_workflow(specs_dir))
+        write_acceptance_terminal_files(specs_dir, workflow)
+        validate_original_tasks_unchanged(specs_dir, state)
+        pre = command_pre_acceptance(specs_dir)
+        if not pre["ok"]:
+            raise SpecProgressError(
+                "Accepted ledger could not reconcile terminal files: " + "; ".join(pre["issues"])
+            )
+        state.setdefault("completed_at", now())
+        save_acceptance_state(specs_dir, state)
+        return acceptance_summary(state)
+    validate_original_tasks_unchanged(specs_dir, state)
+    pre = command_pre_acceptance(specs_dir)
+    if not pre["ok"]:
+        raise SpecProgressError(
+            "Acceptance cannot finish; pre-acceptance failed: " + "; ".join(pre["issues"])
+        )
+    unresolved = unresolved_acceptance_issues(state)
+    pending_agents = [
+        agent for agent in state.get("agents", [])
+        if agent.get("status") in {"planned", "running"}
+    ]
+    pending_fixes = pending_acceptance_fixes(state)
+    unbound = unbound_actionable_agents(state)
+    unit_failures = unit_review_failures(state)
+    integration = current_integration_agent(state)
+    integration_ok = bool(
+        integration
+        and integration.get("status") == "completed"
+        and integration.get("result") == "PASS"
+    )
+    if state.get("status") == "finalizing":
+        snapshot_changed = bool(
+            integration_ok
+            and state.get("finalization_snapshot")
+            != acceptance_immutable_snapshot(specs_dir, state)
+        )
+    else:
+        snapshot_changed = bool(
+            integration_ok
+            and integration.get("review_snapshot") != acceptance_review_snapshot(specs_dir, state)
+        )
+    if snapshot_changed and integration is not None:
+        reset_integration_after_drift(specs_dir, state, integration)
+        raise SpecProgressError(
+            "Acceptance cannot finish; reviewed artifacts changed after global integration review; "
+            "start a fresh global integration review"
+        )
+    if (
+        pending_agents
+        or pending_fixes
+        or unresolved
+        or unbound
+        or unit_failures
+        or not integration_ok
+        or state.get("affected_units")
+    ):
+        details = []
+        if pending_agents:
+            details.append("pending agents: " + ", ".join(agent["agent_id"] for agent in pending_agents))
+        if pending_fixes:
+            details.append("pending fixes: " + ", ".join(fix["fix_id"] for fix in pending_fixes))
+        if unresolved:
+            details.append("unresolved issues: " + ", ".join(issue["issue_id"] for issue in unresolved))
+        if unbound:
+            details.append("unbound ACTIONABLE_ISSUES: " + ", ".join(agent["agent_id"] for agent in unbound))
+        if unit_failures:
+            details.append("required unit reviews not passing: " + ", ".join(unit_failures))
+        if not integration_ok:
+            details.append("global integration review has not passed")
+        if state.get("affected_units"):
+            details.append("affected units still require re-review: " + ", ".join(state["affected_units"]))
+        raise SpecProgressError("Acceptance cannot finish; " + "; ".join(details))
+    workflow = str(state.get("workflow") or detect_workflow(specs_dir))
+    if state.get("status") != "finalizing":
+        state["status"] = "finalizing"
+        state["finalization_snapshot"] = acceptance_immutable_snapshot(specs_dir, state)
+        save_acceptance_state(specs_dir, state)
+
+    write_acceptance_terminal_files(specs_dir, workflow)
+    validate_original_tasks_unchanged(specs_dir, state)
+    post = command_pre_acceptance(specs_dir)
+    if not post["ok"]:
+        raise SpecProgressError(
+            "Acceptance finalization could not verify terminal files: " + "; ".join(post["issues"])
+        )
+    post_snapshot = acceptance_immutable_snapshot(specs_dir, state)
+    if post_snapshot != state.get("finalization_snapshot"):
+        if integration is not None:
+            reset_integration_after_drift(specs_dir, state, integration)
+        raise SpecProgressError(
+            "Acceptance finalization detected reviewed input drift; start a fresh global integration review"
+        )
+    state["status"] = "accepted"
+    state["completed_at"] = now()
+    state["accepted_snapshot"] = post_snapshot
+    state.pop("finalization_snapshot", None)
+    save_acceptance_state(specs_dir, state)
+    if post_snapshot != acceptance_immutable_snapshot(specs_dir, state):
+        if integration is not None:
+            reset_integration_after_drift(specs_dir, state, integration)
+        raise SpecProgressError(
+            "Acceptance finalization detected reviewed input drift; start a fresh global integration review"
+        )
     return acceptance_summary(state)
 
 
@@ -1825,10 +2493,11 @@ def command_sync_check(specs_dir: str | Path, write: bool = False) -> dict[str, 
     have_baseline = bool(old_hashes)
     for artifact in primary_artifacts(workflow):
         old = old_hashes.get(artifact)
-        new = sha256_file(root / artifact)
+        normalized = sha256_text_file(root / artifact)
+        new = normalized
         if new == "missing":
             issues.append(f"{artifact} is missing but referenced by the spec index")
-        elif old is not None and old != new:
+        elif old is not None and old not in sha256_text_variants(root / artifact):
             issues.append(f"{artifact} changed since last approved index")
         elif old is None and have_baseline:
             # Baseline exists but this artifact was never hashed: a newly added
@@ -1984,6 +2653,11 @@ def command_pre_acceptance(specs_dir: str | Path) -> dict[str, object]:
     resume = command_resume(specs_dir)
     issues = list(resume["issues"])
     warnings = list(resume.get("warnings", []))
+    progress = parse_progress(specs_dir)
+    index = parse_flat_yml(specs_path(specs_dir) / "spec.yml")
+    approval = progress.approval if progress.approval != "pending" else index.get("approval", "pending")
+    if approval != "approved":
+        issues.append("Spec artifacts are not approved")
     unchecked = [task.task_id for task in tasks if task.state in {"pending", "active", "blocked", "interrupted"}]
     missing_evidence = [
         task.task_id
@@ -1995,7 +2669,11 @@ def command_pre_acceptance(specs_dir: str | Path) -> dict[str, object]:
     if missing_evidence:
         issues.append(f"Completed/skipped tasks missing evidence: {', '.join(missing_evidence)}")
     try:
-        dirty_business = business_paths(dirty_paths(specs_dir)) if git_available(specs_dir) else []
+        dirty_business = (
+            business_paths(exclude_workflow_paths(dirty_paths(specs_dir), specs_dir))
+            if git_available(specs_dir)
+            else []
+        )
     except SpecProgressError as exc:
         dirty_business = []
         warnings.append(str(exc))
@@ -2006,9 +2684,9 @@ def command_pre_acceptance(specs_dir: str | Path) -> dict[str, object]:
         "issues": issues,
         "warnings": warnings,
         "message": (
-            "Pre-acceptance passed; strict multi-agent final acceptance is still required."
+            "Pre-acceptance passed; adaptive final acceptance is still required."
             if not issues
-            else "Pre-acceptance found issues; strict final acceptance must not start yet."
+            else "Pre-acceptance found issues; final acceptance must not start yet."
         ),
     }
 
@@ -2026,9 +2704,35 @@ def workflow_dirs(specs_root: str | Path) -> list[Path]:
     return dirs
 
 
-def workflow_complete(tasks: list[Task], progress: Progress) -> bool:
-    unresolved = [task for task in tasks if task.state in {"pending", "active", "blocked", "interrupted"}]
-    return progress.status == "Accepted" or not unresolved
+def workflow_complete(specs_dir: Path, progress: Progress) -> bool:
+    if (
+        progress.status != "Accepted"
+        or progress.current_task != "n/a"
+        or progress.approval != "approved"
+    ):
+        return False
+    try:
+        state = load_acceptance_state(specs_dir)
+    except SpecProgressError:
+        return False
+    if state.get("status") != "accepted":
+        return False
+    index = parse_flat_yml(specs_dir / "spec.yml")
+    if index.get("current_task") != "n/a" or index.get("approval") != "approved":
+        return False
+    top: dict[str, str] = {}
+    for line in read_text(specs_dir / "tasks.md").splitlines():
+        if TASK_RE.match(line):
+            break
+        match = TASK_TOP_FIELD_RE.match(line)
+        if match:
+            top[match.group("label").strip().lower()] = match.group("value").strip()
+    task_status = top.get("状态", top.get("status"))
+    current_task = top.get("当前任务", top.get("current task"))
+    return (
+        task_status in {None, "Accepted"}
+        and current_task in {None, "n/a"}
+    )
 
 
 def workflow_record(specs_dir: Path, specs_root: Path) -> dict[str, object]:
@@ -2036,8 +2740,8 @@ def workflow_record(specs_dir: Path, specs_root: Path) -> dict[str, object]:
     progress = parse_progress(specs_dir)
     tasks = parse_tasks(specs_dir)
     stats = task_stats(tasks)
-    complete = workflow_complete(tasks, progress)
-    accepted = progress.status == "Accepted"
+    complete = workflow_complete(specs_dir, progress)
+    accepted = complete
     try:
         resume = command_resume(specs_dir)
         resume_status = str(resume.get("status", "unknown"))
@@ -2173,7 +2877,6 @@ def build_parser() -> argparse.ArgumentParser:
         "guard-commit",
         "pre-acceptance",
         "init",
-        "acceptance-init",
         "acceptance-status",
         "acceptance-plan-fixes",
         "acceptance-next-round",
@@ -2181,6 +2884,14 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         cmd = sub.add_parser(name)
         cmd.add_argument("specs_dir")
+    acceptance_init = sub.add_parser("acceptance-init")
+    acceptance_init.add_argument("specs_dir")
+    acceptance_init.add_argument(
+        "--mode",
+        choices=sorted(ACCEPTANCE_MODES),
+        default=None,
+        help="Acceptance policy: quick, adaptive (default), or full",
+    )
     start = sub.add_parser("start")
     start.add_argument("specs_dir")
     start.add_argument("task_id")
@@ -2209,7 +2920,7 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_complete.add_argument("specs_dir")
     acceptance_complete.add_argument("agent_id")
     acceptance_complete.add_argument("--result", required=True)
-    acceptance_complete.add_argument("--report", default="")
+    acceptance_complete.add_argument("--report", required=True)
     acceptance_issue = sub.add_parser("acceptance-record-issue")
     acceptance_issue.add_argument("specs_dir")
     acceptance_issue.add_argument("--unit", required=True)
@@ -2285,7 +2996,7 @@ def main(argv: list[str] | None = None) -> int:
             print(format_json(result))
             return 0 if result["ok"] else 1
         if args.command == "acceptance-init":
-            print(format_json(command_acceptance_init(args.specs_dir)))
+            print(format_json(command_acceptance_init(args.specs_dir, args.mode)))
             return 0
         if args.command == "acceptance-status":
             print(format_json(command_acceptance_status(args.specs_dir)))
