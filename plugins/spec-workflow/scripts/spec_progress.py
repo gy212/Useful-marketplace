@@ -597,10 +597,22 @@ def task_plan_digest(tasks: list[Task]) -> str:
 def acceptance_tasks_file_hash(specs_dir: str | Path) -> str:
     """Hash tasks.md content while ignoring mutable top-level progress metadata."""
     path = specs_path(specs_dir) / "tasks.md"
-    stable_lines = [
-        line for line in read_text(path).splitlines()
-        if not TASK_TOP_FIELD_RE.match(line)
-    ]
+    mutable_labels = {
+        "状态", "status", "当前任务", "current task",
+        "进度", "progress", "最后更新", "last updated",
+    }
+    stable_lines: list[str] = []
+    before_first_task = True
+    for line in read_text(path).splitlines():
+        if TASK_RE.match(line):
+            before_first_task = False
+        match = TASK_TOP_FIELD_RE.match(line)
+        if before_first_task and match and match.group("label").strip().lower() in mutable_labels:
+            line = (
+                f"{match.group('indent')}{match.group('prefix')}{match.group('label')}"
+                f"{match.group('colon')}{match.group('suffix')}<mutable>"
+            )
+        stable_lines.append(line)
     payload = "\n".join(stable_lines).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:12]
 
@@ -690,7 +702,7 @@ def default_acceptance_state(
     root = specs_path(specs_dir)
     tasks = parse_tasks(root)
     mode = normalize_acceptance_mode(acceptance_mode)
-    if mode == "quick" and any(task.is_high_risk for task in tasks):
+    if mode == "quick" and any(task.risk not in {"low", "低", "低风险"} for task in tasks):
         raise SpecProgressError(
             "Quick acceptance is limited to low-risk workflows; use adaptive or full"
         )
@@ -743,7 +755,13 @@ def load_acceptance_state(specs_dir: str | Path) -> dict[str, object]:
         data["legacy_schema_version"] = 1
         data.setdefault("acceptance_mode", "full")
         data.setdefault("max_auto_fix_rounds", ACCEPTANCE_MAX_AUTO_FIX_ROUNDS)
-        data.setdefault("auto_fix_rounds", 0)
+        historical_fix_rounds = {
+            int(fix.get("round", 1)) for fix in data.get("fixes", [])
+        }
+        data.setdefault(
+            "auto_fix_rounds",
+            min(len(historical_fix_rounds), ACCEPTANCE_MAX_AUTO_FIX_ROUNDS),
+        )
         data["policy"] = (
             "legacy full review; P0-P2 trigger fixes and affected-unit re-review; "
             "P3-P4 are deferred; one final global integration review"
@@ -1116,6 +1134,8 @@ def review_worktree_digest(specs_dir: str | Path) -> str:
         elif target.is_dir():
             for child in sorted(path for path in target.rglob("*") if path.is_file()):
                 child_name = child.relative_to(root).as_posix()
+                if child_name in ignored:
+                    continue
                 entries.append((child_name, hashlib.sha256(child.read_bytes()).hexdigest()))
         else:
             entries.append((normalized, "missing"))
@@ -1134,6 +1154,38 @@ def acceptance_review_snapshot(specs_dir: str | Path, state: dict[str, object]) 
         snapshot["git_commit"] = current_commit(root)
         snapshot["git_worktree_digest"] = review_worktree_digest(root)
     return snapshot
+
+
+def acceptance_immutable_snapshot(specs_dir: str | Path, state: dict[str, object]) -> dict[str, object]:
+    """Review snapshot excluding task/index metadata changed only by finalization."""
+    snapshot = acceptance_review_snapshot(specs_dir, state)
+    files = dict(snapshot.get("files", {}))
+    files.pop("tasks.md", None)
+    files.pop("spec.yml", None)
+    snapshot["files"] = files
+    return snapshot
+
+
+def reset_integration_after_drift(
+    specs_dir: str | Path,
+    state: dict[str, object],
+    agent: dict[str, object],
+) -> None:
+    agent.update({
+        "status": "planned",
+        "result": None,
+        "started_at": None,
+        "completed_at": None,
+        "report": "",
+    })
+    agent.pop("review_snapshot", None)
+    state.pop("finalization_snapshot", None)
+    state.pop("accepted_snapshot", None)
+    state["status"] = "integration-planned"
+    note = "Reviewed inputs changed; a fresh global integration review is required"
+    if note not in state.setdefault("notes", []):
+        state["notes"].append(note)
+    save_acceptance_state(specs_dir, state)
 
 
 def create_acceptance_fixes_file(specs_dir: str | Path, state: dict[str, object]) -> None:
@@ -1265,6 +1317,28 @@ def business_paths(paths: list[str]) -> list[str]:
     result = []
     for path in paths:
         if any(path.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        result.append(path)
+    return result
+
+
+def exclude_workflow_paths(paths: list[str], specs_dir: str | Path) -> list[str]:
+    """Remove the current spec directory, including collapsed untracked parents."""
+    root = repo_root_for(specs_dir)
+    try:
+        relative = specs_path(specs_dir).relative_to(root).as_posix().rstrip("/")
+    except ValueError:
+        return paths
+    if relative in {"", "."}:
+        ignored = progress_file_paths(specs_dir)
+        return [path for path in paths if path.replace("\\", "/") not in ignored]
+    prefix = relative + "/"
+    result: list[str] = []
+    for path in paths:
+        normalized = path.replace("\\", "/").rstrip("/")
+        if normalized == relative or normalized.startswith(prefix):
+            continue
+        if relative.startswith(normalized + "/"):
             continue
         result.append(path)
     return result
@@ -1459,6 +1533,19 @@ def sha256_text_file(path: Path) -> str:
         return "missing"
     data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     return hashlib.sha256(data).hexdigest()[:12]
+
+
+def sha256_text_variants(path: Path) -> set[str]:
+    """Hashes for raw, LF, and CRLF forms of the same UTF-8 text."""
+    if not path.is_file():
+        return {"missing"}
+    raw = path.read_bytes()
+    normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    crlf = normalized.replace(b"\n", b"\r\n")
+    return {
+        hashlib.sha256(content).hexdigest()[:12]
+        for content in (raw, normalized, crlf)
+    }
 
 
 def extract_requirement_ids(specs_dir: str | Path, workflow: str) -> list[str]:
@@ -1671,6 +1758,7 @@ def command_acceptance_start_agent(specs_dir: str | Path, agent_id: str) -> dict
             or unit_review_failures(state)
         ):
             raise SpecProgressError("Global integration review is not ready to start")
+        agent["review_snapshot"] = acceptance_review_snapshot(specs_dir, state)
     agent["status"] = "running"
     agent["started_at"] = now()
     state["status"] = "integration-running" if agent.get("role") == "integration" else "agents-running"
@@ -1720,13 +1808,18 @@ def command_acceptance_complete_agent(
                 "Global integration PASS requires a clean pre-acceptance state: "
                 + "; ".join(pre["issues"])
             )
+        if agent.get("review_snapshot") != acceptance_review_snapshot(specs_dir, state):
+            reset_integration_after_drift(specs_dir, state, agent)
+            raise SpecProgressError(
+                "Reviewed inputs changed while the global integration review was running; "
+                "start a fresh global integration review"
+            )
     agent["status"] = "completed"
     agent["result"] = normalized
     agent["completed_at"] = now()
     agent["report"] = report.strip()
     if agent["role"] == "integration":
         if normalized == "PASS":
-            agent["review_snapshot"] = acceptance_review_snapshot(specs_dir, state)
             state["status"] = "ready-to-finish"
         else:
             state["status"] = "review-complete"
@@ -2032,9 +2125,41 @@ def command_acceptance_next_round(specs_dir: str | Path) -> dict[str, object]:
     return acceptance_summary(state)
 
 
+def write_acceptance_terminal_files(specs_dir: str | Path, workflow: str) -> None:
+    write_progress(
+        specs_dir,
+        workflow,
+        "Accepted",
+        "n/a",
+        "approved",
+        "done",
+        verification=f"Final acceptance passed through {ACCEPTANCE_STATE_FILE}",
+        note="Final acceptance accepted",
+    )
+    update_tasks_metadata(specs_dir, status="Accepted", current_task="n/a")
+    write_spec_index(
+        specs_dir,
+        workflow,
+        "n/a",
+        "approved",
+        preserve_hashes=True,
+        preserve_task_plan_hash=True,
+    )
+
+
 def command_acceptance_finish(specs_dir: str | Path) -> dict[str, object]:
     state = load_acceptance_state(specs_dir)
     if state.get("status") == "accepted":
+        workflow = str(state.get("workflow") or detect_workflow(specs_dir))
+        write_acceptance_terminal_files(specs_dir, workflow)
+        validate_original_tasks_unchanged(specs_dir, state)
+        pre = command_pre_acceptance(specs_dir)
+        if not pre["ok"]:
+            raise SpecProgressError(
+                "Accepted ledger could not reconcile terminal files: " + "; ".join(pre["issues"])
+            )
+        state.setdefault("completed_at", now())
+        save_acceptance_state(specs_dir, state)
         return acceptance_summary(state)
     validate_original_tasks_unchanged(specs_dir, state)
     pre = command_pre_acceptance(specs_dir)
@@ -2056,10 +2181,23 @@ def command_acceptance_finish(specs_dir: str | Path) -> dict[str, object]:
         and integration.get("status") == "completed"
         and integration.get("result") == "PASS"
     )
-    snapshot_changed = bool(
-        integration_ok
-        and integration.get("review_snapshot") != acceptance_review_snapshot(specs_dir, state)
-    )
+    if state.get("status") == "finalizing":
+        snapshot_changed = bool(
+            integration_ok
+            and state.get("finalization_snapshot")
+            != acceptance_immutable_snapshot(specs_dir, state)
+        )
+    else:
+        snapshot_changed = bool(
+            integration_ok
+            and integration.get("review_snapshot") != acceptance_review_snapshot(specs_dir, state)
+        )
+    if snapshot_changed and integration is not None:
+        reset_integration_after_drift(specs_dir, state, integration)
+        raise SpecProgressError(
+            "Acceptance cannot finish; reviewed artifacts changed after global integration review; "
+            "start a fresh global integration review"
+        )
     if (
         pending_agents
         or pending_fixes
@@ -2067,7 +2205,6 @@ def command_acceptance_finish(specs_dir: str | Path) -> dict[str, object]:
         or unbound
         or unit_failures
         or not integration_ok
-        or snapshot_changed
         or state.get("affected_units")
     ):
         details = []
@@ -2083,34 +2220,40 @@ def command_acceptance_finish(specs_dir: str | Path) -> dict[str, object]:
             details.append("required unit reviews not passing: " + ", ".join(unit_failures))
         if not integration_ok:
             details.append("global integration review has not passed")
-        if snapshot_changed:
-            details.append("reviewed artifacts changed after global integration review")
         if state.get("affected_units"):
             details.append("affected units still require re-review: " + ", ".join(state["affected_units"]))
         raise SpecProgressError("Acceptance cannot finish; " + "; ".join(details))
-    workflow = detect_workflow(specs_dir)
-    write_progress(
-        specs_dir,
-        workflow,
-        "Accepted",
-        "n/a",
-        "approved",
-        "done",
-        verification=f"Final acceptance passed through {ACCEPTANCE_STATE_FILE}",
-        note="Final acceptance accepted",
-    )
-    update_tasks_metadata(specs_dir, status="Accepted", current_task="n/a")
-    write_spec_index(
-        specs_dir,
-        workflow,
-        "n/a",
-        "approved",
-        preserve_hashes=True,
-        preserve_task_plan_hash=True,
-    )
+    workflow = str(state.get("workflow") or detect_workflow(specs_dir))
+    if state.get("status") != "finalizing":
+        state["status"] = "finalizing"
+        state["finalization_snapshot"] = acceptance_immutable_snapshot(specs_dir, state)
+        save_acceptance_state(specs_dir, state)
+
+    write_acceptance_terminal_files(specs_dir, workflow)
+    validate_original_tasks_unchanged(specs_dir, state)
+    post = command_pre_acceptance(specs_dir)
+    if not post["ok"]:
+        raise SpecProgressError(
+            "Acceptance finalization could not verify terminal files: " + "; ".join(post["issues"])
+        )
+    post_snapshot = acceptance_immutable_snapshot(specs_dir, state)
+    if post_snapshot != state.get("finalization_snapshot"):
+        if integration is not None:
+            reset_integration_after_drift(specs_dir, state, integration)
+        raise SpecProgressError(
+            "Acceptance finalization detected reviewed input drift; start a fresh global integration review"
+        )
     state["status"] = "accepted"
     state["completed_at"] = now()
+    state["accepted_snapshot"] = post_snapshot
+    state.pop("finalization_snapshot", None)
     save_acceptance_state(specs_dir, state)
+    if post_snapshot != acceptance_immutable_snapshot(specs_dir, state):
+        if integration is not None:
+            reset_integration_after_drift(specs_dir, state, integration)
+        raise SpecProgressError(
+            "Acceptance finalization detected reviewed input drift; start a fresh global integration review"
+        )
     return acceptance_summary(state)
 
 
@@ -2350,12 +2493,11 @@ def command_sync_check(specs_dir: str | Path, write: bool = False) -> dict[str, 
     have_baseline = bool(old_hashes)
     for artifact in primary_artifacts(workflow):
         old = old_hashes.get(artifact)
-        raw = sha256_file(root / artifact)
         normalized = sha256_text_file(root / artifact)
         new = normalized
         if new == "missing":
             issues.append(f"{artifact} is missing but referenced by the spec index")
-        elif old is not None and old not in {raw, normalized}:
+        elif old is not None and old not in sha256_text_variants(root / artifact):
             issues.append(f"{artifact} changed since last approved index")
         elif old is None and have_baseline:
             # Baseline exists but this artifact was never hashed: a newly added
@@ -2527,7 +2669,11 @@ def command_pre_acceptance(specs_dir: str | Path) -> dict[str, object]:
     if missing_evidence:
         issues.append(f"Completed/skipped tasks missing evidence: {', '.join(missing_evidence)}")
     try:
-        dirty_business = business_paths(dirty_paths(specs_dir)) if git_available(specs_dir) else []
+        dirty_business = (
+            business_paths(exclude_workflow_paths(dirty_paths(specs_dir), specs_dir))
+            if git_available(specs_dir)
+            else []
+        )
     except SpecProgressError as exc:
         dirty_business = []
         warnings.append(str(exc))
@@ -2558,9 +2704,35 @@ def workflow_dirs(specs_root: str | Path) -> list[Path]:
     return dirs
 
 
-def workflow_complete(tasks: list[Task], progress: Progress) -> bool:
-    del tasks
-    return progress.status == "Accepted"
+def workflow_complete(specs_dir: Path, progress: Progress) -> bool:
+    if (
+        progress.status != "Accepted"
+        or progress.current_task != "n/a"
+        or progress.approval != "approved"
+    ):
+        return False
+    try:
+        state = load_acceptance_state(specs_dir)
+    except SpecProgressError:
+        return False
+    if state.get("status") != "accepted":
+        return False
+    index = parse_flat_yml(specs_dir / "spec.yml")
+    if index.get("current_task") != "n/a" or index.get("approval") != "approved":
+        return False
+    top: dict[str, str] = {}
+    for line in read_text(specs_dir / "tasks.md").splitlines():
+        if TASK_RE.match(line):
+            break
+        match = TASK_TOP_FIELD_RE.match(line)
+        if match:
+            top[match.group("label").strip().lower()] = match.group("value").strip()
+    task_status = top.get("状态", top.get("status"))
+    current_task = top.get("当前任务", top.get("current task"))
+    return (
+        task_status in {None, "Accepted"}
+        and current_task in {None, "n/a"}
+    )
 
 
 def workflow_record(specs_dir: Path, specs_root: Path) -> dict[str, object]:
@@ -2568,8 +2740,8 @@ def workflow_record(specs_dir: Path, specs_root: Path) -> dict[str, object]:
     progress = parse_progress(specs_dir)
     tasks = parse_tasks(specs_dir)
     stats = task_stats(tasks)
-    complete = workflow_complete(tasks, progress)
-    accepted = progress.status == "Accepted"
+    complete = workflow_complete(specs_dir, progress)
+    accepted = complete
     try:
         resume = command_resume(specs_dir)
         resume_status = str(resume.get("status", "unknown"))
